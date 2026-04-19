@@ -52,6 +52,9 @@ app = FastAPI(title="MLX Task Router", lifespan=lifespan)
 
 @app.post("/v1/messages")
 async def messages(request: Request):
+    if config.log_routing:
+        auth_headers = [k for k in request.headers if k.lower() in ("x-api-key", "authorization") or k.lower().startswith("anthropic-")]
+        print(f"[headers] Auth keys present: {auth_headers}")
     body = await request.json()
 
     try:

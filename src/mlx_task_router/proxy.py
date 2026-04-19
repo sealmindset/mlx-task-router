@@ -13,6 +13,15 @@ _FORWARD_HEADERS = {
     "anthropic-version",
     "anthropic-beta",
     "x-api-key",
+    "authorization",
+}
+
+_SKIP_HEADERS = {
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "accept-encoding",
 }
 
 _TIMEOUT = httpx.Timeout(300.0, connect=30.0)
@@ -20,12 +29,19 @@ _TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 
 def _build_headers(incoming_headers: dict[str, str]) -> dict[str, str]:
     headers: dict[str, str] = {}
+    has_auth = False
     for key, value in incoming_headers.items():
-        if key.lower() in _FORWARD_HEADERS:
-            headers[key] = value
+        lower = key.lower()
+        if lower in _FORWARD_HEADERS or lower.startswith("anthropic-"):
+            headers[lower] = value
+            if lower in ("x-api-key", "authorization"):
+                has_auth = True
 
-    if config.anthropic_api_key:
+    if not has_auth and config.anthropic_api_key:
         headers["x-api-key"] = config.anthropic_api_key
+        print("[proxy] No auth from client, using router API key")
+    elif has_auth:
+        print(f"[proxy] Passing through client auth ({'authorization' if 'authorization' in headers else 'x-api-key'})")
 
     headers.setdefault("anthropic-version", "2023-06-01")
     headers.setdefault("content-type", "application/json")
