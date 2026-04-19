@@ -74,6 +74,7 @@ class Config:
     anthropic_api_key: str = ""
     anthropic_api_url: str = ""
     max_local_context_tokens: int = 0
+    routing_threshold: float = 0.0
     log_routing: bool = True
     gears: dict[str, GearProfile] = field(default_factory=dict)
 
@@ -90,6 +91,9 @@ class Config:
         )
         self.max_local_context_tokens = self.max_local_context_tokens or int(
             os.getenv("MAX_LOCAL_CONTEXT_TOKENS", "32000")
+        )
+        self.routing_threshold = self.routing_threshold or float(
+            os.getenv("ROUTING_THRESHOLD", "0.5")
         )
         self.log_routing = os.getenv("LOG_ROUTING", "true").lower() == "true"
         if not self.gears:

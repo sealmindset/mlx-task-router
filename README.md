@@ -29,6 +29,11 @@ An intelligent proxy server for [Claude Code](https://docs.anthropic.com/en/docs
   - [Switching Gears at Runtime](#switching-gears-at-runtime)
   - [Custom Models](#custom-models)
   - [Memory Considerations](#memory-considerations)
+- [Cost Tracking](#cost-tracking)
+- [Response Caching](#response-caching)
+- [Health Watchdog](#health-watchdog)
+- [Routing Feedback](#routing-feedback)
+- [Fallback to Cloud](#fallback-to-cloud)
 - [CLI Reference](#cli-reference)
 - [API Endpoints](#api-endpoints)
 - [Configuration Reference](#configuration-reference)
@@ -82,23 +87,35 @@ You change nothing about how you use Claude Code. The routing is automatic and i
 
 ### Routing Logic
 
-The router examines the latest user message in each request and applies rules in priority order:
+The router uses **confidence scoring** instead of binary pattern matching. Each signal contributes a weighted score; the request routes locally only when the total score meets the threshold (default 0.5).
+
+**Hard overrides (bypass scoring):**
 
 | Priority | Rule | Route |
 |----------|------|-------|
 | 1 | Message starts with `@cloud` | Forward to Anthropic |
 | 2 | Message starts with `@local` | Handle locally |
-| 3 | Local model not loaded or switching gears | Forward to Anthropic |
+| 3 | Local model not loaded or unhealthy | Forward to Anthropic |
 | 4 | Estimated context exceeds `MAX_LOCAL_CONTEXT_TOKENS` | Forward to Anthropic |
-| 5 | Matches CLI patterns AND no complex patterns | Handle locally |
-| 6 | Matches both CLI and complex patterns | Forward to Anthropic |
-| 7 | Default (no pattern match) | Forward to Anthropic |
 
-**CLI patterns** include: git operations, GitHub CLI (gh), package managers (npm, pip, cargo, brew), Docker, build systems (make, cmake), file operations, and CI/CD tasks.
+**Confidence scoring (if no override applies):**
 
-**Complex patterns** include: explain, refactor, debug, implement, design, optimize, migrate, and any request asking for analysis or new code creation.
+| Signal | Score | Example |
+|--------|-------|---------|
+| Executable detected as first word | +0.6 | `git status`, `docker ps` |
+| Executable detected elsewhere | +0.3 | "check the npm logs" |
+| CLI action phrase | +0.5 | "commit and push", "run the tests" |
+| Short message (<80 chars) | +0.1 | Most CLI commands |
+| Complexity pattern detected | -0.6 | "explain", "refactor", "debug" |
+| Question mark present | -0.1 | "how does this work?" |
+| Long message (>200 chars) | -0.1 | Detailed requests |
+| Feedback penalty | -0.0 to -0.4 | Triggers that previously caused fallbacks |
 
-The default is always to forward to Anthropic. Local routing is opt-in by pattern match, ensuring you never get a degraded experience on tasks that matter.
+**Executable detection** works by checking if words in the message exist in your system's `$PATH` using `shutil.which()`. No whitelist needed — any CLI tool installed on your machine is automatically recognized. Common English words that happen to be executables (like `time`, `sort`, `less`) are filtered out.
+
+**Feedback loop**: the router tracks which triggers (e.g., `exec:git`) succeed or fail. If a trigger's failure rate exceeds 30% after 2+ attempts, a score penalty is applied automatically. This data persists across restarts in `~/.config/mlx-task-router/feedback.json`.
+
+The default is always to forward to Anthropic. Local routing requires a positive score above the threshold, ensuring you never get a degraded experience on tasks that matter.
 
 ### Why Claude Code Stays in Control
 
@@ -231,19 +248,38 @@ That's it. Claude Code now sends all requests through the router. Use it exactly
 
 ### Making It Permanent
 
-Add to your `~/.zshrc` (macOS default) or `~/.bashrc`:
+To avoid setting the environment variable every time you open a terminal, add it to your shell profile:
 
 ```bash
-# Route Claude Code through MLX Task Router
-export ANTHROPIC_BASE_URL=http://localhost:8888
-```
-
-Then reload:
-```bash
+echo '' >> ~/.zshrc
+echo '# MLX Task Router — route Claude Code through local proxy' >> ~/.zshrc
+echo 'export ANTHROPIC_BASE_URL=http://localhost:8888' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-**Note:** When the router isn't running, Claude Code requests will fail with a connection error. Either start the router first, or temporarily unset the variable: `unset ANTHROPIC_BASE_URL`.
+Or for bash users:
+```bash
+echo '' >> ~/.bashrc
+echo '# MLX Task Router — route Claude Code through local proxy' >> ~/.bashrc
+echo 'export ANTHROPIC_BASE_URL=http://localhost:8888' >> ~/.bashrc
+source ~/.bashrc
+```
+
+After this, every new terminal session and every reboot will have `ANTHROPIC_BASE_URL` set automatically. Claude Code will always route through the proxy.
+
+**Verify it's set:**
+```bash
+echo $ANTHROPIC_BASE_URL
+# Should print: http://localhost:8888
+```
+
+**To temporarily bypass the router** (talk directly to Anthropic):
+```bash
+unset ANTHROPIC_BASE_URL
+claude
+```
+
+**Note:** When the router isn't running, Claude Code requests will fail with a connection error. If you've installed the [launchd service](#running-as-a-background-service-launchd), the router starts automatically on login so this is rarely an issue. If you haven't, start the router before using Claude Code.
 
 ### Running as a Background Service (launchd)
 
@@ -409,6 +445,149 @@ Approximate memory usage by model size (4-bit quantization):
 
 Leave at least 8–10GB free for macOS, Claude Code, and other applications. On a 128GB M4 Max, you can comfortably run any model up to 70B while using other MLX services simultaneously.
 
+## Cost Tracking
+
+Every request is tracked with token counts and estimated cost savings. Stats persist to disk and survive restarts.
+
+**Check your savings:**
+```bash
+curl -s http://localhost:8888/stats | python3 -m json.tool
+```
+
+**Example output:**
+```json
+{
+    "requests_total": 847,
+    "requests_local": 312,
+    "requests_forwarded": 535,
+    "tokens_local_input": 156000,
+    "tokens_local_output": 23400,
+    "tokens_forwarded_input": 1240000,
+    "tokens_forwarded_output": 384000,
+    "cost_saved_usd": 0.819,
+    "started_at": "2025-04-19T12:00:00Z",
+    "last_reset": "2025-04-19T12:00:00Z",
+    "local_percentage": 36.8,
+    "cost_saved_display": "$0.8190",
+    "pricing_tier": "sonnet"
+}
+```
+
+**How cost savings are calculated:**
+
+Each locally-routed request would have cost money if sent to Anthropic. The router calculates what you *would have paid* based on the token count and Anthropic's pricing:
+
+| Model Tier | Input (per MTok) | Output (per MTok) |
+|------------|-----------------|-------------------|
+| Sonnet (default) | $3.00 | $15.00 |
+| Opus | $15.00 | $75.00 |
+| Haiku | $0.25 | $1.25 |
+
+The tier is auto-detected from the model name in the request (Claude Code sends the model it thinks it's talking to).
+
+**Quick summary** is also shown on the root endpoint:
+```bash
+curl -s http://localhost:8888/
+```
+
+**Reset counters:**
+```bash
+curl -s -X POST http://localhost:8888/stats/reset
+```
+
+Stats are persisted to `~/.config/mlx-task-router/stats.json` every 30 seconds.
+
+## Response Caching
+
+Locally-routed requests are cached to avoid regenerating identical responses. If the same message is sent within the TTL window, the cached response is returned instantly.
+
+```bash
+# Check cache stats
+curl -s http://localhost:8888/cache | python3 -m json.tool
+
+# Clear the cache
+curl -s -X POST http://localhost:8888/cache/clear
+```
+
+**Configuration:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CACHE_TTL` | `60` | Cache time-to-live in seconds |
+| `CACHE_MAX_ENTRIES` | `100` | Maximum cached responses |
+
+Cache keys are based on the latest user message text and the list of available tool names. Only locally-routed responses are cached — forwarded responses are never cached.
+
+## Health Watchdog
+
+A background watchdog monitors the local model's health every 30 seconds. If the model becomes unresponsive, the watchdog:
+
+1. Marks the model as **unhealthy** after 3 consecutive failures
+2. **All requests forward to Anthropic** automatically (zero downtime)
+3. Attempts **auto-recovery** by reloading the current gear
+4. If recovery succeeds, resumes local routing
+
+```bash
+# Check watchdog status
+curl -s http://localhost:8888/watchdog | python3 -m json.tool
+
+# Health endpoint now shows model health
+curl -s http://localhost:8888/health
+# Returns "degraded" status if model is unhealthy
+```
+
+**Configuration:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WATCHDOG_INTERVAL` | `30` | Seconds between health checks |
+| `WATCHDOG_MAX_FAILURES` | `3` | Consecutive failures before marking unhealthy |
+
+## Routing Feedback
+
+The router learns from its own mistakes. Every locally-routed request tracks whether the trigger (e.g., `exec:git`) succeeded or triggered a fallback to the cloud.
+
+```bash
+# View trigger reliability stats
+curl -s http://localhost:8888/feedback | python3 -m json.tool
+
+# Reset feedback data
+curl -s -X POST http://localhost:8888/feedback/reset
+```
+
+**Example output:**
+```json
+{
+  "exec:git": {
+    "attempts": 45,
+    "failures": 1,
+    "failure_rate": "2%",
+    "penalty": 0.0
+  },
+  "exec:quota": {
+    "attempts": 3,
+    "failures": 2,
+    "failure_rate": "67%",
+    "penalty": -0.27
+  }
+}
+```
+
+Penalties kick in after 2+ attempts with >30% failure rate, scaling up to -0.4 at 100% failure. Data persists in `~/.config/mlx-task-router/feedback.json`.
+
+## Fallback to Cloud
+
+If the local model throws an exception during generation, the router automatically retries the request via the Anthropic API. This is transparent — Claude Code never sees the failure.
+
+The fallback is logged:
+```
+[fallback] Local generation failed: <error>
+[fallback] Retrying via Anthropic API
+[feedback] Recorded failure for trigger 'exec:git'
+```
+
+For streaming requests, the response is fully buffered before sending to the client, so failures are caught before any partial response is sent.
+
 ## CLI Reference
 
 ```
@@ -460,12 +639,34 @@ mlx-router gears
 | `GET` | `/gear` | Current active gear and loading state |
 | `POST` | `/gear/{name}` | Switch to a different gear (eco, sport, track) |
 
+### Cost Tracking
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/stats` | Full statistics — requests, tokens, cost saved, local percentage |
+| `POST` | `/stats/reset` | Reset all counters to zero |
+
+### Caching
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/cache` | Cache stats — hits, misses, hit rate, entries, TTL |
+| `POST` | `/cache/clear` | Flush all cached responses |
+
+### Routing Feedback
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/feedback` | Per-trigger reliability stats and penalties |
+| `POST` | `/feedback/reset` | Clear all feedback data |
+
 ### Operations
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Health check — model status, current gear, loading state |
-| `GET` | `/` | Server info — version, model status, active gear |
+| `GET` | `/health` | Health check — model status, model health, current gear, loading state |
+| `GET` | `/watchdog` | Watchdog status — healthy, recovering, failures, last error |
+| `GET` | `/` | Server info — version, model status, active gear, cost saved |
 
 ## Configuration Reference
 
@@ -499,7 +700,22 @@ All settings are configured via `~/.config/mlx-task-router/.env` or as environme
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MAX_LOCAL_CONTEXT_TOKENS` | `32000` | Requests with estimated context above this are forwarded to Anthropic. Prevents slow local inference on large conversations. |
+| `ROUTING_THRESHOLD` | `0.5` | Minimum confidence score to route locally. Lower = more local routing, higher = more conservative. |
 | `LOG_ROUTING` | `true` | Print routing decisions to stdout for debugging. |
+
+### Cache Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CACHE_TTL` | `60` | Seconds before cached responses expire. |
+| `CACHE_MAX_ENTRIES` | `100` | Maximum number of cached responses. Oldest evicted first. |
+
+### Watchdog Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WATCHDOG_INTERVAL` | `30` | Seconds between model health checks. |
+| `WATCHDOG_MAX_FAILURES` | `3` | Consecutive failures before marking model unhealthy. |
 
 ## Architecture Deep Dive
 
@@ -508,9 +724,10 @@ All settings are configured via `~/.config/mlx-task-router/.env` or as environme
 1. Claude Code sends an HTTP request to `localhost:8888/v1/messages` in the standard Anthropic Messages API format, including system prompts, conversation history, tool definitions, and the latest user message.
 
 2. The **router** extracts the latest user message text and classifies the request:
-   - Pattern matching against CLI task indicators and complexity indicators
-   - Context length estimation (character count / 4 as a token approximation)
    - Override prefix detection (`@cloud`, `@local`)
+   - Watchdog health check (is the local model responsive?)
+   - Context length estimation (character count / 4 as a token approximation)
+   - Confidence scoring: executable detection via `$PATH`, action phrase matching, complexity signals, message length, and feedback penalties
 
 3. **If routed locally:**
    - The system prompt is replaced with a concise, task-focused prompt (the original Claude Code system prompt can be 10K+ tokens — too large for efficient local inference)
@@ -571,22 +788,29 @@ mlx-task-router/
 ├── .gitignore                        # Excludes .env, __pycache__, dist, etc.
 ├── LICENSE                           # Apache License 2.0
 ├── README.md                         # This file
+├── TODO.md                           # Planned enhancements
 └── src/
     └── mlx_task_router/
         ├── __init__.py               # Package version
         ├── __main__.py               # python -m mlx_task_router support
+        ├── cache.py                  # Response cache for local requests
         ├── cli.py                    # CLI entry point (mlx-router command)
         ├── config.py                 # Configuration loading, gear profiles
+        ├── feedback.py               # Routing feedback loop (trigger reliability)
         ├── local.py                  # MLX model manager, generation, gear switching
         ├── models.py                 # Pydantic models (Anthropic API format)
         ├── proxy.py                  # Async HTTP passthrough to Anthropic
-        ├── router.py                 # Request classification engine
+        ├── router.py                 # Confidence-scored request classification
         ├── server.py                 # FastAPI application, endpoint handlers
-        └── tool_format.py            # Anthropic ↔ OpenAI tool format conversion
+        ├── stats.py                  # Cost tracking and token statistics
+        ├── tool_format.py            # Anthropic ↔ OpenAI tool format conversion
+        └── watchdog.py               # Model health monitoring and auto-recovery
 
 Runtime files (created after setup):
 ~/.config/mlx-task-router/
 ├── .env                              # Your configuration (API key, gear, port)
+├── feedback.json                     # Routing feedback data (auto-managed)
+├── stats.json                        # Persistent cost/token statistics
 └── mlx-router.log                    # Service logs (when running via launchd)
 
 ~/Library/LaunchAgents/
@@ -703,7 +927,7 @@ launchctl load ~/Library/LaunchAgents/com.sealmindset.mlx-task-router.plist
 - **Tool-use reliability varies by model.** Local models may occasionally produce malformed tool calls or choose suboptimal tools. The default gears are selected for strong function-calling performance, but they are not Claude.
 - **No real-time streaming for local generation.** Local responses are buffered before being streamed as SSE events. You won't see token-by-token output from the local model — the full response arrives at once, then streams to Claude Code. This is planned for a future release.
 - **Simplified system prompt for local routing.** The local model receives a short task-focused prompt instead of Claude Code's full system prompt. This improves local performance but means the model doesn't have all of Claude Code's behavioral guidelines.
-- **Pattern-based routing is heuristic.** The router uses regex patterns, not semantic understanding. Edge cases exist — a request like "commit the fix for the auth bug" matches both CLI and complex patterns and will be forwarded to Anthropic.
+- **Routing is heuristic.** The router uses confidence scoring based on `$PATH` executable detection and regex patterns, not semantic understanding. Edge cases exist — the feedback loop helps mitigate these over time.
 - **Single model at a time.** Only one gear (model) is loaded in memory. Gear switches require unloading and reloading, which takes 10–60 seconds.
 - **No conversation state tracking.** The router doesn't track which model handled which turn. Each request is classified independently. This works because Claude Code sends the full conversation in every request.
 
@@ -727,11 +951,11 @@ Contributions are welcome. Please:
 4. Submit a pull request
 
 Areas where help is especially welcome:
-- Additional routing patterns for common CLI tasks
 - Real-time streaming for local generation
 - Support for additional model families and their tool-calling formats
 - Benchmarking local model performance on common Claude Code workflows
 - A TUI or web dashboard for gear management and routing statistics
+- Per-session routing analytics
 
 ## License
 

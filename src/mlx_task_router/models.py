@@ -47,7 +47,7 @@ class SystemContent(BaseModel):
 
 
 class ThinkingConfig(BaseModel):
-    type: Literal["enabled", "disabled"]
+    type: str
     budget_tokens: Optional[int] = None
 
 
