@@ -10,6 +10,13 @@ An intelligent proxy server for [Claude Code](https://docs.anthropic.com/en/docs
   - [Architecture](#architecture)
   - [Routing Logic](#routing-logic)
   - [Why Claude Code Stays in Control](#why-claude-code-stays-in-control)
+- [Works With Any AI Project](#works-with-any-ai-project)
+  - [One Router, All Projects](#one-router-all-projects)
+  - [SDK Examples](#sdk-examples)
+  - [API Compatibility](#api-compatibility)
+  - [Routing Decisions By Task Type](#routing-decisions-by-task-type)
+  - [Safety Guarantees](#safety-guarantees)
+  - [Cost Impact](#cost-impact)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
   - [Development Install](#development-install)
@@ -24,10 +31,8 @@ An intelligent proxy server for [Claude Code](https://docs.anthropic.com/en/docs
   - [Making It Permanent](#making-it-permanent)
   - [Running as a Background Service (launchd)](#running-as-a-background-service-launchd)
   - [Routing Overrides](#routing-overrides)
-- [Gear Shifting](#gear-shifting)
-  - [Built-in Gears](#built-in-gears)
-  - [Switching Gears at Runtime](#switching-gears-at-runtime)
-  - [Custom Models](#custom-models)
+- [Model Configuration](#model-configuration)
+  - [Changing Models](#changing-models)
   - [Memory Considerations](#memory-considerations)
 - [Cost Tracking](#cost-tracking)
 - [Response Caching](#response-caching)
@@ -59,12 +64,12 @@ On a usage-based plan, these mundane tasks add up. You're paying premium prices 
 
 ## Solution
 
-MLX Task Router sits between Claude Code and the Anthropic API as a transparent proxy. It inspects each request, classifies it, and routes it to the appropriate backend:
+MLX Task Router sits between **any application that calls the Anthropic API** and the real API as a transparent inline proxy. It inspects each request, scores it for complexity, and routes it to the appropriate backend:
 
-- **Mundane CLI tasks** (git, gh, npm, docker, make, etc.) go to a **free local model** running on your Mac's Apple Silicon via MLX.
-- **Complex tasks** (explain code, refactor, debug, implement features, etc.) go to the **real Anthropic API** where Claude's full reasoning capability is needed.
+- **Simple tasks** (git, CLI commands, short queries, basic code generation) go to a **free local model** running on your Mac's Apple Silicon via MLX.
+- **Complex tasks** (explain code, refactor, debug, architecture, extended thinking) go to the **real Anthropic API** where Claude's full reasoning capability is needed.
 
-You change nothing about how you use Claude Code. The routing is automatic and invisible.
+This works with Claude Code, Windsurf, custom AI apps, or any project using the Anthropic SDK. **No code changes required** — just redirect the base URL. The routing is automatic, invisible, and fail-safe.
 
 ## How It Works
 
@@ -87,35 +92,38 @@ You change nothing about how you use Claude Code. The routing is automatic and i
 
 ### Routing Logic
 
-The router uses **confidence scoring** instead of binary pattern matching. Each signal contributes a weighted score; the request routes locally only when the total score meets the threshold (default 0.5).
+The router uses **aggressive local routing** — the default is LOCAL, not forward. Only requests with sufficient forward signals are forwarded to Claude API. This maximizes cost savings while maintaining fail-open safety (any local generation error automatically falls back to Claude).
 
-**Hard overrides (bypass scoring):**
+**Hard guards (bypass scoring):**
 
 | Priority | Rule | Route |
 |----------|------|-------|
 | 1 | Message starts with `@cloud` | Forward to Anthropic |
 | 2 | Message starts with `@local` | Handle locally |
 | 3 | Local model not loaded or unhealthy | Forward to Anthropic |
-| 4 | Estimated context exceeds `MAX_LOCAL_CONTEXT_TOKENS` | Forward to Anthropic |
+| 4 | Request has `thinking.budget_tokens` | Forward to Anthropic |
+| 5 | Estimated context exceeds `MAX_LOCAL_CONTEXT_TOKENS` | Forward to Anthropic |
 
-**Confidence scoring (if no override applies):**
+**Forward scoring (if no guard applies):**
+
+The forward score starts at 0. Positive signals push toward forwarding. If `forward_score >= ROUTING_THRESHOLD` (default 0.5), the request forwards. Otherwise it stays LOCAL.
 
 | Signal | Score | Example |
 |--------|-------|---------|
-| Executable detected as first word | +0.6 | `git status`, `docker ps` |
-| Executable detected elsewhere | +0.3 | "check the npm logs" |
-| CLI action phrase | +0.5 | "commit and push", "run the tests" |
-| Short message (<80 chars) | +0.1 | Most CLI commands |
-| Complexity pattern detected | -0.6 | "explain", "refactor", "debug" |
-| Question mark present | -0.1 | "how does this work?" |
-| Long message (>200 chars) | -0.1 | Detailed requests |
-| Feedback penalty | -0.0 to -0.4 | Triggers that previously caused fallbacks |
+| Complexity pattern | +0.5 | "explain", "refactor", "debug this bug" |
+| Code generation request | +0.3 | "write a function", "scaffold", "optimize" |
+| Extended conversation (>10 turns) | +0.4 | Long multi-turn sessions |
+| Long message (>500 chars) | +0.2 | Detailed requests |
+| Question chain (2+ `?`) | +0.2 | "what is this? why? how?" |
+| Executable detected first | -0.3 | `git status`, `docker ps` (reinforces local) |
+| CLI action phrase | -0.3 | "commit and push", "run the tests" |
+| Short message (<80 chars, no forward signals) | -0.1 | Simple commands |
 
 **Executable detection** works by checking if words in the message exist in your system's `$PATH` using `shutil.which()`. No whitelist needed — any CLI tool installed on your machine is automatically recognized. Common English words that happen to be executables (like `time`, `sort`, `less`) are filtered out.
 
 **Feedback loop**: the router tracks which triggers (e.g., `exec:git`) succeed or fail. If a trigger's failure rate exceeds 30% after 2+ attempts, a score penalty is applied automatically. This data persists across restarts in `~/.config/mlx-task-router/feedback.json`.
 
-The default is always to forward to Anthropic. Local routing requires a positive score above the threshold, ensuring you never get a degraded experience on tasks that matter.
+**Fail-open guarantee**: if the local model errors during generation, the request is automatically retried against Claude API. You never get a broken experience.
 
 ### Why Claude Code Stays in Control
 
@@ -128,6 +136,156 @@ This means:
 - If the local model makes a bad tool call, Claude Code catches it through its normal validation
 
 The local model is a cheaper brain making decisions; Claude Code is the hands doing the work.
+
+## Works With Any AI Project
+
+The router is **infrastructure-level** — it operates at the HTTP layer, completely outside your application code. No plugins, no skills, no per-project setup. One router serves all your projects simultaneously.
+
+### One Router, All Projects
+
+```
+┌──────────────────┐
+│ Claude Code       │──┐
+└──────────────────┘  │
+                      │    ┌──────────────────────────┐
+┌──────────────────┐  │    │                          │    ┌───────────────┐
+│ Windsurf          │──┼───►│  MLX Task Router        │───►│ Claude API    │
+└──────────────────┘  │    │  localhost:8888          │    │ (paid, only   │
+                      │    │                          │    │  when needed) │
+┌──────────────────┐  │    │  Routes ALL projects     │    └───────────────┘
+│ Your Custom       │──┘    │  simultaneously          │
+│ AI App            │       └────────────┬─────────────┘
+└──────────────────┘                     │
+                                         ▼
+                                   Local MLX Model
+                                   (free, ~70-80%)
+```
+
+Start the router once, set one environment variable, and every project that talks to the Anthropic API gets routed through it automatically.
+
+### SDK Examples
+
+**Python (Anthropic SDK):**
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(
+    api_key="your-key",
+    base_url="http://localhost:8888",  # ← only change needed
+)
+
+response = client.messages.create(
+    model="claude-sonnet-4-20250514",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "git status"}],
+)
+# Handled locally for FREE — your app doesn't know the difference
+```
+
+**TypeScript/Node (Anthropic SDK):**
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic({
+  apiKey: "your-key",
+  baseURL: "http://localhost:8888", // ← only change needed
+});
+
+const response = await client.messages.create({
+  model: "claude-sonnet-4-20250514",
+  max_tokens: 1024,
+  messages: [{ role: "user", content: "run the tests" }],
+});
+// Handled locally — zero API cost
+```
+
+**cURL:**
+
+```bash
+curl http://localhost:8888/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "list the branches"}]
+  }'
+```
+
+**Claude Code / Windsurf:**
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8888
+# Launch Claude Code or Windsurf normally — routing is automatic
+```
+
+**Any HTTP client:**
+
+```env
+# Just change the base URL in your app's config
+ANTHROPIC_BASE_URL=http://localhost:8888
+```
+
+### API Compatibility
+
+The router implements the full Anthropic Messages API contract. Your app cannot tell the difference between a local response and a Claude response.
+
+| Feature | Supported | Notes |
+|---------|-----------|-------|
+| `POST /v1/messages` | ✅ | Full request/response format |
+| `POST /v1/messages/count_tokens` | ✅ | Counts locally when model loaded |
+| Streaming (`stream: true`) | ✅ | SSE events in Anthropic format |
+| Non-streaming | ✅ | JSON response |
+| Tool use (`tool_use` / `tool_result`) | ✅ | Translates to local model format, returns Anthropic format |
+| Auth passthrough (`x-api-key`) | ✅ | Forwards client auth or uses router's key |
+| `authorization` header | ✅ | Forwarded transparently |
+| `anthropic-version` header | ✅ | Forwarded (defaults to `2023-06-01`) |
+| `anthropic-beta` headers | ✅ | Forwarded transparently |
+| Thinking mode (`budget_tokens`) | ✅ | Hard-forwards to Claude |
+| Unknown content blocks | ✅ | Graceful fallback — forwards raw request |
+| Schema drift / new API features | ✅ | Parse failure → raw forward to Claude |
+
+### Routing Decisions By Task Type
+
+| Your App Sends | Router Decision | Why | Cost |
+|---------------|----------------|-----|------|
+| CLI commands (`git status`, `npm install`) | **LOCAL** | Executable detected | Free |
+| "commit and push", "run the tests" | **LOCAL** | CLI action phrase | Free |
+| Short questions, greetings | **LOCAL** | Default local, no forward signals | Free |
+| Simple code generation | **LOCAL** | Codegen score below threshold | Free |
+| Complex reasoning, debugging | **CLAUDE** | Complexity score ≥ 0.5 | Paid |
+| "Explain how authentication works" | **CLAUDE** | Complexity pattern | Paid |
+| "Refactor this module" | **CLAUDE** | Complexity pattern | Paid |
+| Extended thinking (`budget_tokens`) | **CLAUDE** | Hard forward | Paid |
+| Large context (>32K tokens) | **CLAUDE** | Context limit exceeded | Paid |
+| Model not loaded / unhealthy | **CLAUDE** | Fail-open safety | Paid |
+| `@cloud` prefix | **CLAUDE** | User override | Paid |
+| `@local` prefix | **LOCAL** | User override | Free |
+| Unknown/new API features | **CLAUDE** | Graceful passthrough | Paid |
+
+### Safety Guarantees
+
+The router **never degrades your app's capabilities**:
+
+- **Fail-open**: If the local model errors during generation, the request is automatically retried against Claude. Your app never sees the failure.
+- **Schema drift tolerance**: If a request contains fields the router doesn't understand (new Anthropic API features, new content block types), it forwards the raw request directly to Claude.
+- **Auth passthrough**: The router forwards whatever API key your app sends. If none provided, it falls back to its own configured key.
+- **Health monitoring**: A watchdog checks model health every 30s. If unhealthy, all requests forward to Claude until recovery.
+- **No code changes**: Your application code requires zero modifications beyond the base URL.
+
+### Cost Impact
+
+With aggressive local routing (default configuration), approximately **70-80% of requests** are handled locally at zero cost.
+
+| Scenario | Paid API Calls | Free Local Calls | Savings |
+|----------|---------------|-----------------|--------|
+| Without router (500 requests) | 500 | 0 | 0% |
+| With router (500 requests) | ~100-150 | ~350-400 | **70-80%** |
+
+See [INTEGRATION.md](INTEGRATION.md) for the full integration guide.
 
 ## Prerequisites
 
@@ -225,14 +383,14 @@ You'll see:
 ```
 MLX Task Router v0.1.0
   Listening on 0.0.0.0:8888
-  Default gear: sport
+  Model: mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
   Upstream API: https://api.anthropic.com
 
 Configure Claude Code:
   export ANTHROPIC_BASE_URL=http://localhost:8888
 
-[gear] Loading sport: mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
-[gear] sport loaded in 12.3s
+[model] Loading mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
+[model] Loaded in 12.3s
 ```
 
 ### Starting Claude Code
@@ -384,53 +542,26 @@ You can force routing on any individual message by prefixing it inside Claude Co
 
 The prefix is stripped before the request is processed — the model never sees it.
 
-## Gear Shifting
+## Model Configuration
 
-Switch between model profiles at runtime without restarting the server. Think of it like gear ratios in a sports car — shift up for power, down for speed.
+The router loads a single MLX model at startup. The default is `Qwen3-Coder-30B-A3B-Instruct-4bit`, a Mixture-of-Experts model (30B total parameters, ~3B active per token) that offers a good balance of capability and speed for CLI tasks.
 
-### Built-in Gears
+### Changing Models
 
-| Gear | Model | Size | Active Params | Best For |
-|------|-------|------|---------------|----------|
-| **eco** | `Qwen2.5-Coder-7B-Instruct-4bit` | ~4GB | 7B | Fast, simple code tasks (git status, npm install) |
-| **sport** | `Qwen3-Coder-30B-A3B-Instruct-4bit` | ~17GB | ~3B (MoE) | Balanced — default for most CLI work |
-| **track** | `Qwen3-Coder-Next-4bit` | ~45GB | ~3B (MoE) | Complex local tasks needing strong code understanding |
-
-**sport** is the default. It uses a Mixture-of-Experts architecture — 30B total parameters but only ~3B active per token, giving you large-model knowledge with small-model speed.
-
-### Switching Gears at Runtime
-
-```bash
-# See what's available and what's active
-curl -s http://localhost:8888/gears | python3 -m json.tool
-
-# Shift to track for heavy lifting
-curl -s -X POST http://localhost:8888/gear/track
-
-# Shift back to sport for everyday use
-curl -s -X POST http://localhost:8888/gear/sport
-
-# Check current gear
-curl -s http://localhost:8888/gear
-```
-
-During a gear switch:
-1. The current model is unloaded from memory
-2. The new model is loaded (10–60 seconds depending on size)
-3. Any requests arriving during the switch are **automatically forwarded to Anthropic** — zero downtime
-
-### Custom Models
-
-Override any gear's model via environment variable:
+Set the `MLX_MODEL` environment variable to any model from the [MLX Community on Hugging Face](https://huggingface.co/mlx-community):
 
 ```bash
 # In ~/.config/mlx-task-router/.env
-GEAR_ECO_MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
-GEAR_SPORT_MODEL=mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
-GEAR_TRACK_MODEL=mlx-community/Codestral-22B-v0.1-4bit
+MLX_MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
+MLX_MAX_TOKENS=4096
 ```
 
-Any model from the [MLX Community on Hugging Face](https://huggingface.co/mlx-community) works. Choose models that support function calling / tool use for best results.
+Or specify at startup:
+```bash
+mlx-router serve --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
+```
+
+Choose models that support function calling / tool use for best results.
 
 ### Memory Considerations
 
@@ -443,7 +574,7 @@ Approximate memory usage by model size (4-bit quantization):
 | 30B–32B | 17–19GB | 64GB+ |
 | 70B+ | 38–42GB | 128GB |
 
-Leave at least 8–10GB free for macOS, Claude Code, and other applications. On a 128GB M4 Max, you can comfortably run any model up to 70B while using other MLX services simultaneously.
+Leave at least 8–10GB free for macOS, Claude Code, and other applications.
 
 ## Cost Tracking
 
@@ -524,7 +655,7 @@ A background watchdog monitors the local model's health every 30 seconds. If the
 
 1. Marks the model as **unhealthy** after 3 consecutive failures
 2. **All requests forward to Anthropic** automatically (zero downtime)
-3. Attempts **auto-recovery** by reloading the current gear
+3. Attempts **auto-recovery** by reloading the model
 4. If recovery succeeds, resumes local routing
 
 ```bash
@@ -596,14 +727,13 @@ mlx-router [command] [options]
 Commands:
   serve     Start the proxy server (default if no command given)
   init      Create config directory (~/.config/mlx-task-router/.env)
-  gears     List available gear profiles
 
 Options for 'serve':
-  --host TEXT     Bind address (default: 0.0.0.0)
-  --port INT      Bind port (default: 8888)
-  --gear TEXT     Initial gear: eco, sport, or track (default: sport)
-  --version       Show version and exit
-  --help          Show help and exit
+  --host TEXT      Bind address (default: 0.0.0.0)
+  --port INT       Bind port (default: 8888)
+  --model TEXT     MLX model to load (HuggingFace path)
+  --version        Show version and exit
+  --help           Show help and exit
 ```
 
 **Examples:**
@@ -612,14 +742,11 @@ Options for 'serve':
 # Start with defaults
 mlx-router
 
-# Start on a different port with eco gear
-mlx-router serve --port 9000 --gear eco
+# Start on a different port with a smaller model
+mlx-router serve --port 9000 --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 
 # Initialize config for first-time setup
 mlx-router init
-
-# Check what gears are available
-mlx-router gears
 ```
 
 ## API Endpoints
@@ -630,14 +757,6 @@ mlx-router gears
 |--------|----------|-------------|
 | `POST` | `/v1/messages` | Messages endpoint — automatically routed based on content |
 | `POST` | `/v1/messages/count_tokens` | Token counting (uses local tokenizer if model loaded, otherwise forwards) |
-
-### Gear Management
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/gears` | List all gear profiles with active status |
-| `GET` | `/gear` | Current active gear and loading state |
-| `POST` | `/gear/{name}` | Switch to a different gear (eco, sport, track) |
 
 ### Cost Tracking
 
@@ -664,9 +783,10 @@ mlx-router gears
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Health check — model status, model health, current gear, loading state |
+| `GET` | `/health` | Health check — model status, model health, loading state |
 | `GET` | `/watchdog` | Watchdog status — healthy, recovering, failures, last error |
-| `GET` | `/` | Server info — version, model status, active gear, cost saved |
+| `GET` | `/perf` | Performance metrics — latency percentiles, tokens/sec, request counts |
+| `GET` | `/` | Server info — version, model status, cost saved |
 
 ## Configuration Reference
 
@@ -690,17 +810,35 @@ All settings are configured via `~/.config/mlx-task-router/.env` or as environme
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DEFAULT_GEAR` | `sport` | Gear profile to load on startup (`eco`, `sport`, or `track`). |
-| `GEAR_ECO_MODEL` | `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit` | Model for the eco gear. |
-| `GEAR_SPORT_MODEL` | `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` | Model for the sport gear. |
-| `GEAR_TRACK_MODEL` | `mlx-community/Qwen3-Coder-Next-4bit` | Model for the track gear. |
+| `MLX_MODEL` | `mlx-community/Qwen3-Coder-Next-4bit` | MLX model to load at startup (any HuggingFace path from [mlx-community](https://huggingface.co/mlx-community)). Qwen3-Coder-Next: MoE 80B/3B-active, purpose-built for IDE agentic coding (SWE-bench 70.6%). Requires 128GB. |
+| `MLX_MAX_TOKENS` | `16384` | Maximum tokens the local model can generate per response. |
+
+### Generation Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MLX_TEMPERATURE` | `1.0` | Sampling temperature. Qwen3-Coder-Next best practice: 1.0 — DO NOT use 0.0. |
+| `MLX_TOP_P` | `0.95` | Nucleus sampling threshold. Qwen3-Coder-Next best practice: 0.95. |
+| `MLX_TOP_K` | `40` | Top-K sampling. Qwen3-Coder-Next best practice: 40. |
+| `MLX_REPETITION_PENALTY` | `1.05` | Prevents degenerate repetition loops in model output. |
+| `MLX_GENERATION_TIMEOUT` | `120` | Seconds before local generation times out and fails over to Claude. |
+
+### Speculative Decoding (Optional)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MLX_DRAFT_MODEL` | `""` | Small draft model for speculative decoding. Empty = disabled. Example: `mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit` |
+| `MLX_SPECULATIVE_TOKENS` | `5` | Number of candidate tokens per speculative step. |
+
+Speculative decoding uses a small draft model to predict tokens, then verifies them in batch with the main model. This can speed up generation 1.5-2.5x with no quality loss. The draft model adds ~1GB of memory.
 
 ### Routing Settings
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MAX_LOCAL_CONTEXT_TOKENS` | `32000` | Requests with estimated context above this are forwarded to Anthropic. Prevents slow local inference on large conversations. |
-| `ROUTING_THRESHOLD` | `0.5` | Minimum confidence score to route locally. Lower = more local routing, higher = more conservative. |
+| `MAX_LOCAL_CONTEXT_TOKENS` | `65536` | Requests with estimated context above this are forwarded to Anthropic. Qwen3-Coder-Next supports 256K native; 64K is conservative for 128GB machines. |
+| `ROUTING_THRESHOLD` | `0.5` | Forward threshold: requests with forward_score ≥ this value go to Claude. Higher = more stays local (aggressive). |
+| `ADAPTIVE_ROUTING` | `true` | Auto-calibrate threshold from feedback data. Raises threshold when local success rate is high (keep more local), lowers it on high failure rate. |
 | `LOG_ROUTING` | `true` | Print routing decisions to stdout for debugging. |
 
 ### Cache Settings
@@ -795,10 +933,11 @@ mlx-task-router/
         ├── __main__.py               # python -m mlx_task_router support
         ├── cache.py                  # Response cache for local requests
         ├── cli.py                    # CLI entry point (mlx-router command)
-        ├── config.py                 # Configuration loading, gear profiles
+        ├── config.py                 # Configuration loading
         ├── feedback.py               # Routing feedback loop (trigger reliability)
-        ├── local.py                  # MLX model manager, generation, gear switching
+        ├── local.py                  # MLX model manager, local generation
         ├── models.py                 # Pydantic models (Anthropic API format)
+        ├── perf.py                   # Request performance metrics
         ├── proxy.py                  # Async HTTP passthrough to Anthropic
         ├── router.py                 # Confidence-scored request classification
         ├── server.py                 # FastAPI application, endpoint handlers
@@ -808,7 +947,7 @@ mlx-task-router/
 
 Runtime files (created after setup):
 ~/.config/mlx-task-router/
-├── .env                              # Your configuration (API key, gear, port)
+├── .env                              # Your configuration (API key, model, port)
 ├── feedback.json                     # Routing feedback data (auto-managed)
 ├── stats.json                        # Persistent cost/token statistics
 └── mlx-router.log                    # Service logs (when running via launchd)
@@ -841,7 +980,7 @@ Runtime files (created after setup):
 
 - Requests routed locally never leave your machine. Your code, prompts, and conversation history stay entirely on your Mac.
 - Requests routed to Anthropic follow Anthropic's standard data handling policies.
-- The router does not log message content — only routing decisions (route type, reason, gear name).
+- The router does not log message content — only routing decisions (route type, reason, model name).
 
 ## Troubleshooting
 
@@ -878,9 +1017,9 @@ Check that `ANTHROPIC_BASE_URL` is set to `http://localhost:8888` (not `https`).
 
 The model generates text instead of structured tool calls, or calls non-existent tools.
 
-- Try switching to a more capable gear: `curl -X POST http://localhost:8888/gear/track`
+- Try a more capable model by setting `MLX_MODEL` in your config and restarting
 - Use `@cloud` for that specific request to fall back to Anthropic
-- Some models handle function calling better than others. The default Qwen3 models are chosen for strong tool-use performance.
+- Some models handle function calling better than others. The default Qwen3 model is chosen for strong tool-use performance.
 
 ### Forwarded requests fail with 401
 
@@ -888,13 +1027,13 @@ Your Anthropic API key is missing or invalid. Check `~/.config/mlx-task-router/.
 
 ### High memory usage
 
-Check which gear is active: `curl http://localhost:8888/gear`. Switch to a smaller gear: `curl -X POST http://localhost:8888/gear/eco`. Monitor memory with `Activity Monitor` or `htop`.
+Check which model is loaded: `curl http://localhost:8888/health`. Try a smaller model by setting `MLX_MODEL=mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` (~17GB) in your config and restarting. Monitor memory with `Activity Monitor` or `htop`.
 
 ### Requests are slow
 
 Local inference speed depends on model size and available memory bandwidth. If local requests are too slow:
-- Switch to `eco` gear for faster inference
-- Increase `MAX_LOCAL_CONTEXT_TOKENS` threshold to send more requests to Anthropic
+- Try a smaller/faster model (e.g. `MLX_MODEL=mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` — ~60-90 tok/s)
+- Lower `MAX_LOCAL_CONTEXT_TOKENS` threshold to send more requests to Anthropic
 - Ensure no other heavy processes are competing for memory bandwidth
 
 ### launchd service won't start
@@ -924,11 +1063,11 @@ launchctl load ~/Library/LaunchAgents/com.sealmindset.mlx-task-router.plist
 ## Limitations
 
 - **Apple Silicon only.** MLX requires Apple Silicon (M1+). This project does not work on Intel Macs or Linux/Windows.
-- **Tool-use reliability varies by model.** Local models may occasionally produce malformed tool calls or choose suboptimal tools. The default gears are selected for strong function-calling performance, but they are not Claude.
+- **Tool-use reliability varies by model.** Local models may occasionally produce malformed tool calls or choose suboptimal tools. The default model is selected for strong function-calling performance, but it is not Claude.
 - **No real-time streaming for local generation.** Local responses are buffered before being streamed as SSE events. You won't see token-by-token output from the local model — the full response arrives at once, then streams to Claude Code. This is planned for a future release.
 - **Simplified system prompt for local routing.** The local model receives a short task-focused prompt instead of Claude Code's full system prompt. This improves local performance but means the model doesn't have all of Claude Code's behavioral guidelines.
 - **Routing is heuristic.** The router uses confidence scoring based on `$PATH` executable detection and regex patterns, not semantic understanding. Edge cases exist — the feedback loop helps mitigate these over time.
-- **Single model at a time.** Only one gear (model) is loaded in memory. Gear switches require unloading and reloading, which takes 10–60 seconds.
+- **Single model at a time.** Only one model is loaded in memory. Changing models requires a restart.
 - **No conversation state tracking.** The router doesn't track which model handled which turn. Each request is classified independently. This works because Claude Code sends the full conversation in every request.
 
 ## Alternatives Considered
@@ -954,8 +1093,9 @@ Areas where help is especially welcome:
 - Real-time streaming for local generation
 - Support for additional model families and their tool-calling formats
 - Benchmarking local model performance on common Claude Code workflows
-- A TUI or web dashboard for gear management and routing statistics
+- A TUI or web dashboard for routing statistics
 - Per-session routing analytics
+- ANE routing classifier for Neural Engine utilization
 
 ## License
 

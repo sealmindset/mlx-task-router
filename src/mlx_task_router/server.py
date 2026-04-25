@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -13,15 +14,20 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from mlx_task_router.annealing import weight_annealer
 from mlx_task_router.cache import response_cache
 from mlx_task_router.config import config
 from mlx_task_router.feedback import routing_feedback
+from mlx_task_router.perf import RequestMetric, perf_metrics
 from mlx_task_router.local import model_manager
 from mlx_task_router.models import MessagesRequest, TokenCountRequest
-from mlx_task_router.proxy import forward_request, stream_forward
+from mlx_task_router.proxy import forward_request, shutdown_client, stream_forward
 from mlx_task_router.router import Route, classify, strip_routing_prefix, _get_latest_user_text
+from mlx_task_router.routing_history import routing_history
+from mlx_task_router.semantic_cache import semantic_cache
 from mlx_task_router.stats import stats
 from mlx_task_router.watchdog import init_watchdog, watchdog as _wd_ref
 
@@ -29,22 +35,34 @@ from mlx_task_router.watchdog import init_watchdog, watchdog as _wd_ref
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     stats.start()
+    routing_feedback.start()
+    weight_annealer.start()
     wd = init_watchdog(model_manager)
-    gear = config.gears.get(config.default_gear)
-    if gear:
+    if config.model_name:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, model_manager.load_gear, gear)
+        await loop.run_in_executor(None, model_manager.load_model, config.model_name)
     else:
-        print(f"[warn] Unknown default gear '{config.default_gear}', starting without model")
+        print("[warn] No MLX_MODEL configured, starting without local model")
     wd.start()
     yield
     wd.stop()
+    weight_annealer.stop()
+    routing_feedback.stop()
     stats.stop()
+    await shutdown_client()
     model_manager.unload()
     print("[server] Shutdown complete")
 
 
 app = FastAPI(title="MLX Task Router", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # --- Main endpoints ---
@@ -60,15 +78,41 @@ async def messages(request: Request):
     try:
         parsed = MessagesRequest(**body)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # Validation failed — forward the raw body to upstream API so the
+        # proxy never blocks requests due to schema drift (e.g. new content
+        # block types like redacted_thinking, document, server_tool_use).
+        print(f"[parse] Validation failed, forwarding raw request: {e}")
+        incoming_headers = dict(request.headers)
+        is_stream = body.get("stream", False)
+        if is_stream:
+            return StreamingResponse(
+                _stream_forward_with_stats(body, incoming_headers),
+                media_type="text/event-stream",
+            )
+        response = await forward_request("/v1/messages", body, incoming_headers)
+        resp_json = response.json()
+        usage = resp_json.get("usage", {})
+        stats.record_forward(
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+        )
+        return JSONResponse(content=resp_json, status_code=response.status_code)
 
     from mlx_task_router.watchdog import watchdog
     model_available = model_manager.is_loaded and (watchdog is None or watchdog.is_healthy)
+    t_route_start = time.time()
     route, reason, trigger = classify(parsed, model_available)
+    routing_ms = (time.time() - t_route_start) * 1000
 
+    model_name = model_manager.current_model or "none"
     if config.log_routing:
-        gear_name = model_manager.current_gear.name if model_manager.current_gear else "none"
-        print(f"[route] {route} — {reason} (gear={gear_name})")
+        print(f"[route] {route} — {reason} (model={model_name})")
+
+    routing_history.record(
+        route=route, reason=reason, trigger=trigger,
+        message_text=_get_latest_user_text(parsed.messages),
+        model=model_name,
+    )
 
     # Strip @cloud/@local prefix from the message before sending to any model
     _strip_prefix_from_request(parsed, body)
@@ -78,11 +122,20 @@ async def messages(request: Request):
         tool_names = [t.name for t in parsed.tools] if parsed.tools else None
 
         cached = response_cache.get(latest_text, tool_names)
+        cache_source = "exact"
+        if cached is None:
+            cached = semantic_cache.get(latest_text, tool_names)
+            cache_source = "semantic"
         if cached is not None:
             if config.log_routing:
-                print(f"[cache] HIT — returning cached response (ttl={response_cache.ttl}s)")
+                print(f"[cache] HIT ({cache_source}) — returning cached response")
             if trigger:
                 routing_feedback.record_success(trigger)
+            perf_metrics.record(RequestMetric(
+                timestamp=time.time(), route="cache",
+                total_ms=(time.time() - t_route_start) * 1000,
+                routing_ms=routing_ms,
+            ))
             if parsed.stream:
                 return StreamingResponse(
                     _yield_events(cached),
@@ -90,9 +143,12 @@ async def messages(request: Request):
                 )
             return JSONResponse(content=cached)
 
-        return await _handle_local(parsed, body, request, latest_text, tool_names, trigger)
+        return await _handle_local(
+            parsed, body, request, latest_text, tool_names, trigger,
+            routing_ms=routing_ms,
+        )
     else:
-        return await _handle_forward(parsed, body, request)
+        return await _handle_forward(parsed, body, request, routing_ms=routing_ms)
 
 
 @app.post("/v1/messages/count_tokens")
@@ -147,6 +203,17 @@ async def clear_cache():
     return {"status": "cleared"}
 
 
+@app.get("/semantic-cache")
+async def semantic_cache_stats():
+    return semantic_cache.stats()
+
+
+@app.post("/semantic-cache/clear")
+async def clear_semantic_cache():
+    semantic_cache.clear()
+    return {"status": "cleared"}
+
+
 @app.get("/feedback")
 async def feedback_stats():
     return routing_feedback.stats()
@@ -158,56 +225,31 @@ async def reset_feedback():
     return {"status": "reset"}
 
 
-# --- Gear management ---
+@app.get("/routing/history")
+async def get_routing_history(limit: int = 50):
+    return routing_history.get_history(limit=min(limit, 100))
 
 
-@app.get("/gears")
-async def list_gears():
-    current = model_manager.current_gear
-    gears = []
-    for name, gear in config.gears.items():
-        gears.append(
-            {
-                "name": name,
-                "model": gear.model,
-                "description": gear.description,
-                "max_tokens": gear.max_tokens,
-                "active": current is not None and current.name == name,
-            }
-        )
-    return {"gears": gears, "loading": model_manager.is_loading}
+@app.get("/routing/summary")
+async def get_routing_summary():
+    return routing_history.summary()
 
 
-@app.get("/gear")
-async def current_gear():
-    gear = model_manager.current_gear
-    if gear:
-        return {
-            "name": gear.name,
-            "model": gear.model,
-            "description": gear.description,
-            "loading": model_manager.is_loading,
-        }
-    return {"name": None, "model": None, "loading": model_manager.is_loading}
+@app.post("/routing/clear")
+async def clear_routing_history():
+    routing_history.clear()
+    return {"status": "cleared"}
 
 
-@app.post("/gear/{gear_name}")
-async def switch_gear(gear_name: str):
-    gear = config.gears.get(gear_name)
-    if not gear:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Unknown gear '{gear_name}'. Available: {list(config.gears.keys())}",
-        )
+@app.get("/annealing")
+async def annealing_status():
+    return weight_annealer.status()
 
-    current = model_manager.current_gear
-    if current and current.name == gear_name:
-        return {"status": "already_active", "gear": gear_name}
 
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, model_manager.load_gear, gear)
-
-    return {"status": "switched", "gear": gear_name, "model": gear.model}
+@app.post("/annealing/reset")
+async def reset_annealing():
+    weight_annealer.reset()
+    return {"status": "reset"}
 
 
 # --- Health ---
@@ -216,13 +258,12 @@ async def switch_gear(gear_name: str):
 @app.get("/health")
 async def health():
     from mlx_task_router.watchdog import watchdog
-    gear = model_manager.current_gear
     wd_healthy = watchdog.is_healthy if watchdog else True
     return {
         "status": "healthy" if wd_healthy else "degraded",
         "model_loaded": model_manager.is_loaded,
         "model_healthy": wd_healthy,
-        "gear": gear.name if gear else None,
+        "model": model_manager.current_model,
         "loading": model_manager.is_loading,
     }
 
@@ -235,15 +276,59 @@ async def watchdog_status():
     return watchdog.status()
 
 
+@app.get("/perf")
+async def perf_stats():
+    return perf_metrics.summary()
+
+
+# --- Config ---
+
+
+@app.get("/config")
+async def get_config():
+    return {
+        "model_name": config.model_name,
+        "model_max_tokens": config.model_max_tokens,
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "top_k": config.top_k,
+        "repetition_penalty": config.repetition_penalty,
+        "routing_threshold": config.routing_threshold,
+        "adaptive_routing": config.adaptive_routing,
+        "log_routing": config.log_routing,
+        "max_local_context_tokens": config.max_local_context_tokens,
+    }
+
+
+@app.post("/config/reload")
+async def reload_config():
+    old_model = config.model_name
+    changes = config.reload()
+
+    model_changed = "model_name" in changes
+    reload_needed = model_changed and model_manager.is_loaded
+
+    if reload_needed:
+        print(f"[config] Model changed ({old_model} → {config.model_name}), reloading...")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, model_manager.load_model, config.model_name)
+
+    print(f"[config] Reloaded. Changes: {changes if changes else 'none'}")
+    return {
+        "status": "reloaded",
+        "changes": changes,
+        "model_reloaded": reload_needed,
+    }
+
+
 @app.get("/")
 async def root():
-    gear = model_manager.current_gear
     s = stats.get()
     return {
         "service": "mlx-task-router",
-        "version": "0.1.0",
+        "version": "0.6.0",
         "model_loaded": model_manager.is_loaded,
-        "gear": gear.name if gear else None,
+        "model": model_manager.current_model,
         "requests_total": s["requests_total"],
         "requests_local": s["requests_local"],
         "cost_saved": s["cost_saved_display"],
@@ -251,6 +336,24 @@ async def root():
 
 
 # --- Internal helpers ---
+
+_GENERATION_TIMEOUT = int(__import__("os").getenv("MLX_GENERATION_TIMEOUT", "120"))
+
+
+def _extract_tokens_from_events(events: list[str]) -> tuple[int, int]:
+    """Extract input/output token counts from buffered SSE events."""
+    in_tok, out_tok = 0, 0
+    for event in events:
+        try:
+            if "message_start" in event:
+                data = json.loads(event.split("data: ", 1)[1])
+                in_tok = data.get("message", {}).get("usage", {}).get("input_tokens", 0)
+            elif "message_delta" in event:
+                data = json.loads(event.split("data: ", 1)[1])
+                out_tok = data.get("usage", {}).get("output_tokens", 0)
+        except (json.JSONDecodeError, IndexError):
+            pass
+    return in_tok, out_tok
 
 
 def _strip_prefix_from_request(parsed: MessagesRequest, body: dict[str, Any]):
@@ -287,29 +390,54 @@ async def _handle_local(
     cache_key_text: str | None = None,
     cache_key_tools: list[str] | None = None,
     trigger: str = "",
+    routing_ms: float = 0.0,
 ):
     try:
+        t_gen_start = time.time()
         if parsed.stream:
             events = await _collect_local_stream(parsed)
+            gen_ms = (time.time() - t_gen_start) * 1000
             if cache_key_text:
                 response_cache.put(cache_key_text, events, cache_key_tools)
+                semantic_cache.put(cache_key_text, events, cache_key_tools)
             if trigger:
                 routing_feedback.record_success(trigger)
+            # Extract token counts from SSE events for perf metrics
+            _in, _out = _extract_tokens_from_events(events)
+            perf_metrics.record(RequestMetric(
+                timestamp=time.time(), route="local",
+                total_ms=routing_ms + gen_ms,
+                routing_ms=routing_ms, generation_ms=gen_ms,
+                input_tokens=_in, output_tokens=_out,
+            ))
             return StreamingResponse(
                 _yield_events(events),
                 media_type="text/event-stream",
             )
         else:
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, model_manager.generate, parsed)
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, model_manager.generate, parsed),
+                timeout=_GENERATION_TIMEOUT,
+            )
+            gen_ms = (time.time() - t_gen_start) * 1000
             usage = result.get("usage", {})
+            in_tok = usage.get("input_tokens", 0)
+            out_tok = usage.get("output_tokens", 0)
             stats.record_local(
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
+                input_tokens=in_tok,
+                output_tokens=out_tok,
                 model=parsed.model,
             )
+            perf_metrics.record(RequestMetric(
+                timestamp=time.time(), route="local",
+                total_ms=routing_ms + gen_ms,
+                routing_ms=routing_ms, generation_ms=gen_ms,
+                input_tokens=in_tok, output_tokens=out_tok,
+            ))
             if cache_key_text:
                 response_cache.put(cache_key_text, result, cache_key_tools)
+                semantic_cache.put(cache_key_text, result, cache_key_tools)
             if trigger:
                 routing_feedback.record_success(trigger)
             return JSONResponse(content=result)
@@ -326,8 +454,11 @@ async def _handle_local(
 
 async def _collect_local_stream(parsed: MessagesRequest) -> list[str]:
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, lambda: list(model_manager.stream_generate(parsed))
+    return await asyncio.wait_for(
+        loop.run_in_executor(
+            None, lambda: list(model_manager.stream_generate(parsed))
+        ),
+        timeout=_GENERATION_TIMEOUT,
     )
 
 
@@ -363,26 +494,36 @@ async def _handle_forward(
     parsed: MessagesRequest,
     body: dict[str, Any],
     request: Request,
+    routing_ms: float = 0.0,
 ):
     incoming_headers = dict(request.headers)
 
+    t_fwd_start = time.time()
     if parsed.stream:
         return StreamingResponse(
-            _stream_forward_with_stats(body, incoming_headers),
+            _stream_forward_with_stats(body, incoming_headers, routing_ms=routing_ms),
             media_type="text/event-stream",
         )
     else:
         response = await forward_request("/v1/messages", body, incoming_headers)
+        fwd_ms = (time.time() - t_fwd_start) * 1000
         resp_json = response.json()
         usage = resp_json.get("usage", {})
-        stats.record_forward(
-            input_tokens=usage.get("input_tokens", 0),
-            output_tokens=usage.get("output_tokens", 0),
-        )
+        in_tok = usage.get("input_tokens", 0)
+        out_tok = usage.get("output_tokens", 0)
+        stats.record_forward(input_tokens=in_tok, output_tokens=out_tok)
+        perf_metrics.record(RequestMetric(
+            timestamp=time.time(), route="forward",
+            total_ms=routing_ms + fwd_ms,
+            routing_ms=routing_ms, generation_ms=fwd_ms,
+            input_tokens=in_tok, output_tokens=out_tok,
+        ))
         return JSONResponse(content=resp_json, status_code=response.status_code)
 
 
-async def _stream_forward_with_stats(body: dict[str, Any], incoming_headers: dict[str, str]):
+async def _stream_forward_with_stats(
+    body: dict[str, Any], incoming_headers: dict[str, str], routing_ms: float = 0.0,
+):
     input_tokens = 0
     output_tokens = 0
 
@@ -403,3 +544,9 @@ async def _stream_forward_with_stats(body: dict[str, Any], incoming_headers: dic
             pass
 
     stats.record_forward(input_tokens=input_tokens, output_tokens=output_tokens)
+    perf_metrics.record(RequestMetric(
+        timestamp=time.time(), route="forward",
+        total_ms=0,  # streaming — total_ms not easily captured
+        routing_ms=routing_ms,
+        input_tokens=input_tokens, output_tokens=output_tokens,
+    ))

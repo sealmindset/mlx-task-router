@@ -25,6 +25,27 @@ _SKIP_HEADERS = {
 }
 
 _TIMEOUT = httpx.Timeout(300.0, connect=30.0)
+_LIMITS = httpx.Limits(
+    max_connections=20,
+    max_keepalive_connections=10,
+    keepalive_expiry=30,
+)
+
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=_TIMEOUT, limits=_LIMITS)
+    return _client
+
+
+async def shutdown_client() -> None:
+    global _client
+    if _client and not _client.is_closed:
+        await _client.aclose()
+        _client = None
 
 
 def _build_headers(incoming_headers: dict[str, str]) -> dict[str, str]:
@@ -56,8 +77,13 @@ async def forward_request(
     headers = _build_headers(incoming_headers)
     url = f"{config.anthropic_api_url}{path}"
 
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        response = await client.post(url, json=body, headers=headers)
+    print(f"[proxy] POST {url}")
+    client = _get_client()
+    response = await client.post(url, json=body, headers=headers)
+    if response.status_code != 200:
+        print(f"[proxy] Upstream returned {response.status_code}: {response.text[:200]}")
+    else:
+        print(f"[proxy] Upstream 200 OK")
     return response
 
 
@@ -69,7 +95,14 @@ async def stream_forward(
     headers = _build_headers(incoming_headers)
     url = f"{config.anthropic_api_url}{path}"
 
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        async with client.stream("POST", url, json=body, headers=headers) as response:
-            async for chunk in response.aiter_bytes():
-                yield chunk
+    print(f"[proxy] STREAM {url}")
+    client = _get_client()
+    async with client.stream("POST", url, json=body, headers=headers) as response:
+        if response.status_code != 200:
+            error_body = await response.aread()
+            print(f"[proxy] Upstream stream error {response.status_code}: {error_body[:300]}")
+            yield error_body
+            return
+        async for chunk in response.aiter_bytes():
+            yield chunk
+    print(f"[proxy] Stream completed")

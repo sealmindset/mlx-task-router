@@ -85,18 +85,18 @@ class Watchdog:
             self._attempt_recovery()
 
     def _attempt_recovery(self) -> None:
-        gear = self._manager.current_gear
-        if not gear:
+        model_name = self._manager.current_model
+        if not model_name:
             return
 
         self._recovering = True
-        print(f"[watchdog] Attempting recovery — reloading gear '{gear.name}'")
+        print(f"[watchdog] Attempting recovery — reloading '{model_name}'")
         try:
-            self._manager.load_gear(gear)
+            self._manager.load_model(model_name)
             self._healthy = True
             self._consecutive_failures = 0
             self._last_error = ""
-            print(f"[watchdog] Recovery successful — '{gear.name}' reloaded")
+            print(f"[watchdog] Recovery successful — '{model_name}' reloaded")
         except Exception as e:
             self._last_error = str(e)
             print(f"[watchdog] Recovery failed: {e}")

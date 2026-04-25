@@ -6,12 +6,13 @@ import pytest
 
 from mlx_task_router.router import (
     Route,
-    ROUTING_THRESHOLD,
+    FORWARD_THRESHOLD,
+    _count_turns,
     _estimate_tokens,
     _extract_executable_candidates,
     _first_meaningful_word,
     _get_latest_user_text,
-    _score_request,
+    _score_forward,
     classify,
     strip_routing_prefix,
 )
@@ -76,67 +77,145 @@ class TestExtractCandidates:
 
 
 # ---------------------------------------------------------------------------
-# _score_request
+# _score_forward — higher = more reason to forward
 # ---------------------------------------------------------------------------
 
 
-class TestScoreRequest:
+class TestScoreForward:
+    """In forward-scoring: positive score = push toward Claude, negative = pull toward local."""
+
+    def _msgs(self, text: str) -> list[dict]:
+        return [{"role": "user", "content": text}]
+
     @patch("mlx_task_router.router._is_executable", return_value=True)
-    def test_executable_first_word_high_score(self, mock_exec):
-        score, reasons, trigger = _score_request("git status")
-        assert score >= 0.6
-        assert any("first" in r for r in reasons)
+    def test_executable_first_word_lowers_forward_score(self, mock_exec):
+        score, reasons, trigger = _score_forward("git status", self._msgs("git status"))
+        assert score < 0  # exec pulls score negative = stay local
+        assert any("exec" in r for r in reasons)
         assert trigger.startswith("exec:")
 
     @patch("mlx_task_router.router._is_executable", return_value=False)
-    def test_no_executable_no_exec_score(self, mock_exec):
-        score, reasons, trigger = _score_request("hello world")
+    def test_no_executable_no_exec_signal(self, mock_exec):
+        score, reasons, trigger = _score_forward("hello world", self._msgs("hello world"))
         assert not any("exec:" in r for r in reasons)
 
-    def test_action_phrase_commit_push(self):
-        score, reasons, trigger = _score_request("commit and push")
-        assert score >= 0.5
+    def test_action_phrase_lowers_forward_score(self):
+        score, reasons, trigger = _score_forward("commit and push", self._msgs("commit and push"))
+        assert score < 0  # action phrase pulls score negative = stay local
         assert trigger.startswith("action:")
 
     def test_action_phrase_run_tests(self):
-        score, reasons, trigger = _score_request("run the tests")
-        assert score >= 0.5
+        score, reasons, trigger = _score_forward("run the tests", self._msgs("run the tests"))
+        assert score < 0
 
     def test_action_phrase_install_deps(self):
-        score, reasons, trigger = _score_request("install the dependencies")
-        assert score >= 0.5
+        score, reasons, trigger = _score_forward("install the dependencies", self._msgs("install the dependencies"))
+        assert score < 0
 
-    def test_complexity_reduces_score(self):
-        score, reasons, _ = _score_request("explain how the routing works")
+    def test_complexity_raises_forward_score(self):
+        score, reasons, _ = _score_forward("explain how the routing works", self._msgs("explain how the routing works"))
         assert any("complex" in r for r in reasons)
-        assert score < 0.0
+        assert score > 0  # complexity pushes toward forward
 
-    def test_question_mark_penalty(self):
-        score, reasons, _ = _score_request("what is this?")
-        assert any("question" in r for r in reasons)
-
-    def test_short_message_bonus(self):
-        score, reasons, _ = _score_request("ls")
+    def test_short_message_reduces_forward_score(self):
+        score, reasons, _ = _score_forward("ls", self._msgs("ls"))
         assert any("short" in r for r in reasons)
 
-    def test_long_message_penalty(self):
-        long_text = "x " * 150
-        score, reasons, _ = _score_request(long_text)
+    def test_long_message_raises_forward_score(self):
+        long_text = "x " * 300
+        score, reasons, _ = _score_forward(long_text, self._msgs(long_text))
         assert any("long" in r for r in reasons)
 
     def test_complexity_patterns(self):
         complex_msgs = [
             "refactor this module",
             "explain the code",
-            "write a function for auth",
             "debug this bug",
-            "optimize performance",
-            "what do you think",
+            "code review this code",
             "compare pros and cons",
         ]
         for msg in complex_msgs:
-            score, reasons, _ = _score_request(msg)
+            score, reasons, _ = _score_forward(msg, self._msgs(msg))
             assert any("complex" in r for r in reasons), f"'{msg}' should trigger complexity"
+
+    def test_codegen_patterns(self):
+        codegen_msgs = [
+            "write a function for auth",
+            "create the documentation",
+        ]
+        for msg in codegen_msgs:
+            score, reasons, _ = _score_forward(msg, self._msgs(msg))
+            assert any("codegen" in r for r in reasons), f"'{msg}' should trigger codegen"
+
+    def test_optimize_not_codegen(self):
+        """optimize/improve should NOT trigger codegen — local model handles these."""
+        for msg in ["optimize performance", "improve the code", "enhance readability"]:
+            _, reasons, _ = _score_forward(msg, self._msgs(msg))
+            assert not any("codegen" in r for r in reasons), f"'{msg}' should NOT trigger codegen"
+
+    def test_extended_conversation(self):
+        msgs = [{"role": "user", "content": f"msg{i}"} for i in range(22)]
+        score, reasons, _ = _score_forward("what next", msgs)
+        assert any("turns" in r for r in reasons)
+
+    def test_extended_conversation_under_threshold(self):
+        """15 user turns should NOT trigger extended_conversation (threshold is >20)."""
+        msgs = [{"role": "user", "content": f"msg{i}"} for i in range(15)]
+        _, reasons, _ = _score_forward("what next", msgs)
+        assert not any("turns" in r for r in reasons)
+
+    def test_many_tools_signal(self):
+        """Requests with many tool definitions should push toward forward."""
+        msgs = [{"role": "user", "content": "do something"}]
+        _, reasons_16, _ = _score_forward("do something", msgs, num_tools=16)
+        assert any("tools" in r for r in reasons_16)
+
+    def test_very_many_tools_signal(self):
+        msgs = [{"role": "user", "content": "do something"}]
+        _, reasons_31, _ = _score_forward("do something", msgs, num_tools=31)
+        assert any("tools:31" in r for r in reasons_31)
+
+    def test_question_chain(self):
+        score, reasons, _ = _score_forward("what is this? why? how?", self._msgs("what is this? why? how?"))
+        assert any("questions" in r for r in reasons)
+
+    def test_neutral_message_stays_low(self):
+        """A simple message with no signals should have near-zero forward score."""
+        score, reasons, _ = _score_forward("hello", self._msgs("hello"))
+        assert score < FORWARD_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# _count_turns
+# ---------------------------------------------------------------------------
+
+
+class TestCountTurns:
+    def test_empty(self):
+        assert _count_turns([]) == 0
+
+    def test_single_turn(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        assert _count_turns(msgs) == 1
+
+    def test_multi_turn(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hey"},
+            {"role": "user", "content": "bye"},
+        ]
+        assert _count_turns(msgs) == 2
+
+    def test_tool_result_excluded(self):
+        """User messages containing tool_result blocks should not count as turns."""
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "calling tool"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "thanks"},
+        ]
+        assert _count_turns(msgs) == 2  # "hi" + "thanks", not tool_result
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +285,7 @@ class TestEstimateTokens:
 
 
 # ---------------------------------------------------------------------------
-# classify
+# classify — default is LOCAL, only forward on high forward_score or hard guards
 # ---------------------------------------------------------------------------
 
 
@@ -230,6 +309,15 @@ class TestClassify:
         assert route == Route.FORWARD
         assert "not loaded" in reason
 
+    def test_thinking_requested_forwards(self):
+        req = {
+            "messages": [{"role": "user", "content": "solve this math problem"}],
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+        }
+        route, reason, _ = classify(req, model_loaded=True)
+        assert route == Route.FORWARD
+        assert "thinking" in reason
+
     def test_context_too_large_forwards(self):
         huge = "x " * 200_000
         req = {"messages": [{"role": "user", "content": huge}]}
@@ -241,11 +329,11 @@ class TestClassify:
         assert "too large" in reason
 
     @patch("mlx_task_router.router._is_executable", return_value=True)
-    def test_high_score_routes_local(self, mock_exec):
+    def test_simple_command_routes_local(self, mock_exec):
         req = {"messages": [{"role": "user", "content": "git status"}]}
         route, reason, trigger = classify(req, model_loaded=True)
         assert route == Route.LOCAL
-        assert "score=" in reason
+        assert "fwd=" in reason
 
     def test_complex_request_forwards(self):
         req = {
@@ -261,3 +349,15 @@ class TestClassify:
         route, reason, trigger = classify(req, model_loaded=True)
         assert route == Route.LOCAL
         assert trigger.startswith("action:")
+
+    def test_neutral_message_routes_local(self):
+        """With aggressive routing, ambiguous messages default to LOCAL."""
+        req = {"messages": [{"role": "user", "content": "hello"}]}
+        route, _, _ = classify(req, model_loaded=True)
+        assert route == Route.LOCAL
+
+    def test_short_question_routes_local(self):
+        """Short questions without complexity patterns stay local."""
+        req = {"messages": [{"role": "user", "content": "what time is it?"}]}
+        route, _, _ = classify(req, model_loaded=True)
+        assert route == Route.LOCAL

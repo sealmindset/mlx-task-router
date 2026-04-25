@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 # --- Request models ---
@@ -40,6 +40,18 @@ class ContentBlockThinking(BaseModel):
     signature: Optional[str] = None
 
 
+class ContentBlockRedactedThinking(BaseModel):
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str
+
+
+class ContentBlockGeneric(BaseModel):
+    """Catch-all for unknown/future content block types (e.g. document, server_tool_use)."""
+
+    type: str
+    model_config = ConfigDict(extra="allow")
+
+
 class SystemContent(BaseModel):
     type: Literal["text"] = "text"
     text: str
@@ -63,6 +75,8 @@ ContentBlock = Union[
     ContentBlockToolUse,
     ContentBlockToolResult,
     ContentBlockThinking,
+    ContentBlockRedactedThinking,
+    ContentBlockGeneric,
 ]
 
 

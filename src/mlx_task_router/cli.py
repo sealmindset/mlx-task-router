@@ -30,20 +30,15 @@ def main():
     serve_parser = sub.add_parser("serve", help="Start the proxy server")
     serve_parser.add_argument("--host", default=None, help="Bind address")
     serve_parser.add_argument("--port", type=int, default=None, help="Bind port")
-    serve_parser.add_argument("--gear", default=None, help="Initial gear (eco/sport/track)")
+    serve_parser.add_argument("--model", default=None, help="MLX model to load (HuggingFace path)")
 
     # --- init ---
     sub.add_parser("init", help="Create config directory and example .env")
-
-    # --- gears ---
-    sub.add_parser("gears", help="List available gear profiles")
 
     args = parser.parse_args()
 
     if args.command == "init":
         _init_config()
-    elif args.command == "gears":
-        _list_gears()
     else:
         _serve(args)
 
@@ -55,8 +50,8 @@ def _serve(args):
         config.host = args.host
     if hasattr(args, "port") and args.port:
         config.port = args.port
-    if hasattr(args, "gear") and args.gear:
-        config.default_gear = args.gear
+    if hasattr(args, "model") and args.model:
+        config.model_name = args.model
 
     import uvicorn
 
@@ -64,7 +59,7 @@ def _serve(args):
 
     print(f"MLX Task Router v{__version__}")
     print(f"  Listening on {config.host}:{config.port}")
-    print(f"  Default gear: {config.default_gear}")
+    print(f"  Model: {config.model_name}")
     print(f"  Upstream API: {config.anthropic_api_url}")
     print()
     print("Configure Claude Code:")
@@ -93,25 +88,12 @@ def _init_config():
             "# MLX Task Router Config\n"
             "# See: https://github.com/sealmindset/mlx-task-router\n\n"
             "ANTHROPIC_API_KEY=sk-ant-...\n"
-            "DEFAULT_GEAR=sport\n"
+            "MLX_MODEL=mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit\n"
             "PORT=8888\n"
         )
 
     print(f"Created config at {env_file}")
     print(f"Edit {env_file} to add your ANTHROPIC_API_KEY")
-
-
-def _list_gears():
-    from mlx_task_router.config import config
-
-    print("Available gears:\n")
-    for name, gear in config.gears.items():
-        default = " (default)" if name == config.default_gear else ""
-        print(f"  {name}{default}")
-        print(f"    Model:      {gear.model}")
-        print(f"    Max tokens: {gear.max_tokens}")
-        print(f"    {gear.description}")
-        print()
 
 
 if __name__ == "__main__":

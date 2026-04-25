@@ -12,14 +12,18 @@ from mlx_task_router.config import CONFIG_DIR
 
 STATS_FILE = CONFIG_DIR / "stats.json"
 
-# Anthropic pricing per million tokens (as of 2025)
-# Using Sonnet as the baseline — most common Claude Code model
+# Anthropic pricing per million tokens (as of 2025-Q2)
+# Covers Claude 4, Claude 3.5, and Claude 3 model families
 PRICING = {
-    "sonnet": {"input": 3.00, "output": 15.00},
-    "opus": {"input": 15.00, "output": 75.00},
-    "haiku": {"input": 0.25, "output": 1.25},
+    "opus_4": {"input": 15.00, "output": 75.00},
+    "sonnet_4": {"input": 3.00, "output": 15.00},
+    "sonnet_3_5": {"input": 3.00, "output": 15.00},
+    "haiku_3_5": {"input": 0.80, "output": 4.00},
+    "opus_3": {"input": 15.00, "output": 75.00},
+    "sonnet_3": {"input": 3.00, "output": 15.00},
+    "haiku_3": {"input": 0.25, "output": 1.25},
 }
-DEFAULT_TIER = "sonnet"
+DEFAULT_TIER = "sonnet_4"
 
 _FLUSH_INTERVAL = 30  # seconds
 
@@ -127,11 +131,34 @@ class Stats:
 
 
 def _detect_tier(model: str) -> str:
-    model_lower = model.lower()
-    if "opus" in model_lower:
-        return "opus"
-    if "haiku" in model_lower:
-        return "haiku"
+    m = model.lower()
+
+    # Claude 4 family (e.g. claude-opus-4-*, claude-sonnet-4-*)
+    if "opus-4" in m or "opus_4" in m:
+        return "opus_4"
+    if "sonnet-4" in m or "sonnet_4" in m:
+        return "sonnet_4"
+
+    # Claude 3.5 family (e.g. claude-3-5-sonnet-*, claude-3-5-haiku-*)
+    if "3-5-haiku" in m or "3.5-haiku" in m or "3_5_haiku" in m:
+        return "haiku_3_5"
+    if "3-5-sonnet" in m or "3.5-sonnet" in m or "3_5_sonnet" in m:
+        return "sonnet_3_5"
+
+    # Claude 3 family (e.g. claude-3-opus-*, claude-3-sonnet-*, claude-3-haiku-*)
+    if "3-opus" in m or "3_opus" in m:
+        return "opus_3"
+    if "3-haiku" in m or "3_haiku" in m:
+        return "haiku_3"
+    if "3-sonnet" in m or "3_sonnet" in m:
+        return "sonnet_3"
+
+    # Generic fallback patterns
+    if "opus" in m:
+        return "opus_4"
+    if "haiku" in m:
+        return "haiku_3_5"
+
     return DEFAULT_TIER
 
 

@@ -4,20 +4,42 @@ from mlx_task_router.stats import Stats, _detect_tier
 
 
 class TestDetectTier:
-    def test_opus(self):
-        assert _detect_tier("claude-opus-4") == "opus"
+    # Claude 4 family
+    def test_opus_4(self):
+        assert _detect_tier("claude-opus-4-20250514") == "opus_4"
 
-    def test_haiku(self):
-        assert _detect_tier("claude-haiku-3") == "haiku"
+    def test_sonnet_4(self):
+        assert _detect_tier("claude-sonnet-4-20250514") == "sonnet_4"
 
-    def test_sonnet_default(self):
-        assert _detect_tier("claude-sonnet-4") == "sonnet"
+    # Claude 3.5 family
+    def test_sonnet_3_5(self):
+        assert _detect_tier("claude-3-5-sonnet-20241022") == "sonnet_3_5"
 
-    def test_unknown_defaults_sonnet(self):
-        assert _detect_tier("some-random-model") == "sonnet"
+    def test_haiku_3_5(self):
+        assert _detect_tier("claude-3-5-haiku-20241022") == "haiku_3_5"
+
+    # Claude 3 family
+    def test_opus_3(self):
+        assert _detect_tier("claude-3-opus-20240229") == "opus_3"
+
+    def test_sonnet_3(self):
+        assert _detect_tier("claude-3-sonnet-20240229") == "sonnet_3"
+
+    def test_haiku_3(self):
+        assert _detect_tier("claude-3-haiku-20240307") == "haiku_3"
+
+    # Fallback
+    def test_unknown_defaults_sonnet_4(self):
+        assert _detect_tier("some-random-model") == "sonnet_4"
 
     def test_case_insensitive(self):
-        assert _detect_tier("Claude-OPUS-4") == "opus"
+        assert _detect_tier("Claude-OPUS-4-20250514") == "opus_4"
+
+    def test_generic_opus_fallback(self):
+        assert _detect_tier("my-opus-model") == "opus_4"
+
+    def test_generic_haiku_fallback(self):
+        assert _detect_tier("my-haiku-model") == "haiku_3_5"
 
 
 class TestStats:
