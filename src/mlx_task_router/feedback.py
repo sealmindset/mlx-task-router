@@ -45,14 +45,18 @@ class RoutingFeedback:
             entry["failures"] += 1
             self._save()
 
+    def _penalty_for(self, entry: dict[str, int]) -> float:
+        if entry["attempts"] < 2:
+            return 0.0
+        rate = entry["failures"] / entry["attempts"]
+        return -0.4 * rate if rate > 0.3 else 0.0
+
     def penalty(self, trigger: str) -> float:
         with self._lock:
             entry = self._triggers.get(trigger)
-            if not entry or entry["attempts"] < 2:
+            if not entry:
                 return 0.0
-            rate = entry["failures"] / entry["attempts"]
-            # Scale: 50% failure rate = -0.2, 100% = -0.4
-            return -0.4 * rate if rate > 0.3 else 0.0
+            return self._penalty_for(entry)
 
     def stats(self) -> dict:
         with self._lock:
@@ -63,7 +67,7 @@ class RoutingFeedback:
                     "attempts": entry["attempts"],
                     "failures": entry["failures"],
                     "failure_rate": f"{rate:.0%}",
-                    "penalty": self.penalty(trigger),
+                    "penalty": self._penalty_for(entry),
                 }
             return result
 
