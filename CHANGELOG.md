@@ -24,8 +24,9 @@ Live web UI at `GET /dashboard` — no npm, no build step, served inline by Fast
 - **Session breakdown** — expandable cards per session with triggers and recent decisions
 - **Auto-refresh** — 5-second polling interval, live indicator
 
-### Bug Fix
+### Bug Fixes
 
+- **Streaming cost savings not recorded** — `stats.record_local()` was only called in the non-streaming path of `_handle_local`. Claude Code uses streaming exclusively, so all locally-handled requests showed $0.00 cost savings. Fixed by adding `stats.record_local()` to the streaming path alongside `perf_metrics.record()`.
 - **`mlx-router-ctl status`** — fixed garbled Requests line (`requests_forward` → `requests_forwarded`)
 
 ### Testing

@@ -457,8 +457,13 @@ async def _handle_local(
                 semantic_cache.put(cache_key_text, events, cache_key_tools)
             if trigger:
                 routing_feedback.record_success(trigger)
-            # Extract token counts from SSE events for perf metrics
+            # Extract token counts from SSE events for stats + perf metrics
             _in, _out = _extract_tokens_from_events(events)
+            stats.record_local(
+                input_tokens=_in,
+                output_tokens=_out,
+                model=parsed.model,
+            )
             perf_metrics.record(RequestMetric(
                 timestamp=time.time(), route="local",
                 total_ms=routing_ms + gen_ms,
