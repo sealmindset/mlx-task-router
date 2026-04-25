@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.6.1] — 2026-04-25
+
+### Per-Session Stats
+
+Track routing patterns grouped by coding session for optimization insights.
+
+- **Auto-session detection** — requests within 5 minutes of each other are grouped; gap > 5 min starts a new session. Configurable via `SESSION_GAP_SECONDS`.
+- **Header-based sessions** — reads `x-session-id`, `anthropic-session-id`, or `x-request-id` prefix from request headers for explicit session identification.
+- **Per-session metrics** — request counts (local/forward/cache), token usage, cost saved, top routing triggers, recent decisions (last 50 per session).
+- **Ring buffer** — last 50 sessions in memory, no disk persistence.
+- **5 new endpoints**: `GET /sessions`, `GET /sessions/current`, `GET /sessions/summary`, `GET /sessions/{id}`, `POST /sessions/clear`
+
+### Routing Dashboard
+
+Live web UI at `GET /dashboard` — no npm, no build step, served inline by FastAPI.
+
+- **Summary cards** — total requests, local %, cost saved, tok/s, P50 latency, session count
+- **Routing distribution chart** — doughnut chart (local / forward / cache) via Chart.js
+- **Performance panel** — routing avg, gen avg, forward avg, P95/P99 latency, requests/hour
+- **Config display** — temperature, top-p, top-k, max tokens, context limit, threshold
+- **Recent decisions table** — last 30 routing decisions with time, route, score, trigger, preview
+- **Session breakdown** — expandable cards per session with triggers and recent decisions
+- **Auto-refresh** — 5-second polling interval, live indicator
+
+### Bug Fix
+
+- **`mlx-router-ctl status`** — fixed garbled Requests line (`requests_forward` → `requests_forwarded`)
+
+### Testing
+
+- **241 passed, 7 skipped** (was 207 — +34 new tests)
+- New: 24 session stats unit tests, 7 session endpoint tests, 3 dashboard tests
+
+### Files Changed
+- `session_stats.py` — **new** — SessionTracker + SessionStats classes
+- `dashboard.py` — **new** — HTML template + APIRouter
+- `server.py` — session tracking wired into /v1/messages, session + dashboard endpoints
+- `test_session_stats.py` — **new** — 24 tests
+- `test_server.py` — +10 tests (7 session, 3 dashboard)
+- `install.sh` — bug fix in status display
+
+---
+
 ## [0.6.0] — 2026-04-25
 
 ### Model Upgrade: Qwen3-Coder-Next-4bit

@@ -35,11 +35,11 @@
 - [x] Prompt KV cache — system prompt template cached by hash. Avoids re-encoding identical system prompts across requests.
 - [x] Semantic response cache — Jaccard n-gram similarity matching (threshold=0.85). Falls back to exact-match cache. `GET /semantic-cache`, `POST /semantic-cache/clear`.
 - [x] Self-annealing routing weights — background thread analyzes feedback every 5min, adjusts signal weights via gradient-free optimization. `GET /annealing`, `POST /annealing/reset`.
-- [ ] Per-session stats — track routing patterns per Claude Code session to identify optimization opportunities.
+- [x] Per-session stats — track routing patterns per Claude Code session to identify optimization opportunities. `GET /sessions`, `GET /sessions/current`, `GET /sessions/{id}`, `GET /sessions/summary`, `POST /sessions/clear`.
 
 ## Low Priority
 
-- [ ] Routing dashboard — web UI at `/dashboard` showing live stats, routing decisions, cost savings.
+- [x] Routing dashboard — web UI at `GET /dashboard` showing live stats, routing decisions, cost savings, sessions. Tailwind CSS + Chart.js, 5s auto-refresh.
 - [ ] Multi-model routing — trivial→7B, moderate→32B, complex→Claude. Re-enable gear system with new routing philosophy.
 - [ ] OpenAI API compatibility layer — `/v1/chat/completions` endpoint. Lets OpenAI-compatible apps also benefit from local routing.
 - [ ] Anomaly webhooks — alert when failure rate spikes (n8n integration).

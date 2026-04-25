@@ -442,3 +442,89 @@ class TestAnnealingEndpoints:
         resp = client.post("/annealing/reset")
         assert resp.status_code == 200
         assert resp.json()["status"] == "reset"
+
+
+# ---------------------------------------------------------------------------
+# Tests — Session Stats Endpoints
+# ---------------------------------------------------------------------------
+
+class TestSessionEndpoints:
+    def test_sessions_list(self, client):
+        resp = client.get("/sessions")
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_sessions_summary(self, client):
+        resp = client.get("/sessions/summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "total_sessions" in data
+        assert "active_sessions" in data
+
+    def test_sessions_current_empty(self, client):
+        client.post("/sessions/clear")
+        resp = client.get("/sessions/current")
+        assert resp.status_code == 200
+        assert resp.json()["session"] is None
+
+    def test_sessions_after_request(self, client):
+        client.post("/sessions/clear")
+        client.post(
+            "/v1/messages",
+            json=_make_body("ls -la"),
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01",
+                      "x-session-id": "test-session-1"},
+        )
+        resp = client.get("/sessions/current")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["session_id"] == "test-session-1"
+        assert data["requests_total"] >= 1
+
+    def test_sessions_by_id(self, client):
+        client.post("/sessions/clear")
+        client.post(
+            "/v1/messages",
+            json=_make_body("echo hi"),
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01",
+                      "x-session-id": "lookup-test"},
+        )
+        resp = client.get("/sessions/lookup-test")
+        assert resp.status_code == 200
+        assert resp.json()["session_id"] == "lookup-test"
+
+    def test_sessions_not_found(self, client):
+        resp = client.get("/sessions/nonexistent-session-id")
+        assert resp.status_code == 404
+
+    def test_sessions_clear(self, client):
+        client.post(
+            "/v1/messages",
+            json=_make_body("pwd"),
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+        )
+        resp = client.post("/sessions/clear")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "cleared"
+        resp = client.get("/sessions/summary")
+        assert resp.json()["total_sessions"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests — Dashboard
+# ---------------------------------------------------------------------------
+
+class TestDashboard:
+    def test_dashboard_returns_html(self, client):
+        resp = client.get("/dashboard")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+
+    def test_dashboard_contains_title(self, client):
+        resp = client.get("/dashboard")
+        assert "MLX Task Router" in resp.text
+
+    def test_dashboard_contains_chart(self, client):
+        resp = client.get("/dashboard")
+        assert "routing-chart" in resp.text
+        assert "chart.js" in resp.text.lower() or "Chart" in resp.text

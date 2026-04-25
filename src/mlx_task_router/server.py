@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from mlx_task_router.annealing import weight_annealer
 from mlx_task_router.cache import response_cache
+from mlx_task_router.dashboard import router as dashboard_router
 from mlx_task_router.config import config
 from mlx_task_router.feedback import routing_feedback
 from mlx_task_router.perf import RequestMetric, perf_metrics
@@ -28,6 +29,7 @@ from mlx_task_router.proxy import forward_request, shutdown_client, stream_forwa
 from mlx_task_router.router import Route, classify, strip_routing_prefix, _get_latest_user_text
 from mlx_task_router.routing_history import routing_history
 from mlx_task_router.semantic_cache import semantic_cache
+from mlx_task_router.session_stats import session_tracker
 from mlx_task_router.stats import stats
 from mlx_task_router.watchdog import init_watchdog, watchdog as _wd_ref
 
@@ -63,6 +65,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(dashboard_router)
 
 
 # --- Main endpoints ---
@@ -108,17 +112,33 @@ async def messages(request: Request):
     if config.log_routing:
         print(f"[route] {route} — {reason} (model={model_name})")
 
+    latest_text = _get_latest_user_text(parsed.messages)
     routing_history.record(
         route=route, reason=reason, trigger=trigger,
-        message_text=_get_latest_user_text(parsed.messages),
+        message_text=latest_text,
         model=model_name,
+    )
+
+    # Parse forward score from reason for session tracking
+    _fwd_score = 0.0
+    if "fwd=" in reason:
+        try:
+            _fwd_score = float(reason.split("fwd=")[1].split(" ")[0])
+        except (ValueError, IndexError):
+            pass
+    _session_headers = {k.lower(): v for k, v in request.headers.items()}
+    session_tracker.record(
+        route=route, trigger=trigger,
+        forward_score=_fwd_score,
+        message_preview=latest_text[:80],
+        model=model_name,
+        headers=_session_headers,
     )
 
     # Strip @cloud/@local prefix from the message before sending to any model
     _strip_prefix_from_request(parsed, body)
 
     if route == Route.LOCAL:
-        latest_text = _get_latest_user_text(parsed.messages)
         tool_names = [t.name for t in parsed.tools] if parsed.tools else None
 
         cached = response_cache.get(latest_text, tool_names)
@@ -252,6 +272,41 @@ async def reset_annealing():
     return {"status": "reset"}
 
 
+# --- Sessions ---
+
+
+@app.get("/sessions")
+async def get_sessions(limit: int = 20):
+    return session_tracker.get_all_sessions(limit=min(limit, 50))
+
+
+@app.get("/sessions/current")
+async def get_current_session():
+    current = session_tracker.get_current_session()
+    if current is None:
+        return {"session": None}
+    return current
+
+
+@app.get("/sessions/summary")
+async def get_sessions_summary():
+    return session_tracker.summary()
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    session = session_tracker.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    return session
+
+
+@app.post("/sessions/clear")
+async def clear_sessions():
+    session_tracker.clear()
+    return {"status": "cleared"}
+
+
 # --- Health ---
 
 
@@ -326,7 +381,7 @@ async def root():
     s = stats.get()
     return {
         "service": "mlx-task-router",
-        "version": "0.6.0",
+        "version": "0.6.1",
         "model_loaded": model_manager.is_loaded,
         "model": model_manager.current_model,
         "requests_total": s["requests_total"],

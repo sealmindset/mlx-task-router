@@ -460,7 +460,7 @@ case "${1:-status}" in
         if curl -sf "http://localhost:$PORT/stats" >/dev/null 2>&1; then
             STATS=$(curl -sf "http://localhost:$PORT/stats")
             echo ""
-            echo "  Requests: $(echo "$STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"total={d.get('requests_total',0)}, local={d.get('requests_local',0)}, fwd={d.get('requests_forward',0)}\")" 2>/dev/null)"
+            echo "  Requests: $(echo "$STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"total={d.get('requests_total',0)}, local={d.get('requests_local',0)}, fwd={d.get('requests_forwarded',0)}\")" 2>/dev/null)"
             echo "  Savings:  $(echo "$STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('cost_saved_display','$0.0000'))" 2>/dev/null)"
         fi
         echo ""
