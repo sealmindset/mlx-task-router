@@ -33,19 +33,19 @@ class GearProfile:
 DEFAULT_GEARS: dict[str, GearProfile] = {
     "eco": GearProfile(
         name="eco",
-        model="mlx-community/Qwen3-8B-4bit",
+        model="mlx-community/Qwen3.5-9B-MLX-4bit",
         description="Fast and light — simple tasks",
         max_tokens=4096,
     ),
     "sport": GearProfile(
         name="sport",
-        model="mlx-community/Qwen3-30B-A3B-4bit",
+        model="mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
         description="Balanced — default for CLI tasks",
         max_tokens=8192,
     ),
     "track": GearProfile(
         name="track",
-        model="mlx-community/Qwen2.5-Coder-32B-Instruct-4bit",
+        model="mlx-community/Qwen3-Coder-Next-4bit",
         description="Maximum capability — complex local tasks",
         max_tokens=16384,
     ),

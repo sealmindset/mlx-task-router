@@ -219,7 +219,7 @@ The router and Claude Code each need specific environment variables. Here's what
 mlx-router serve
 ```
 
-On first run, the default model (Qwen3-30B-A3B-4bit, ~17GB) is downloaded from Hugging Face. This happens once; subsequent starts load from the local cache at `~/.cache/huggingface/hub/`.
+On first run, the default model (Qwen3-Coder-30B-A3B-Instruct-4bit, ~17GB) is downloaded from Hugging Face. This happens once; subsequent starts load from the local cache at `~/.cache/huggingface/hub/`.
 
 You'll see:
 ```
@@ -231,7 +231,7 @@ MLX Task Router v0.1.0
 Configure Claude Code:
   export ANTHROPIC_BASE_URL=http://localhost:8888
 
-[gear] Loading sport: mlx-community/Qwen3-30B-A3B-4bit
+[gear] Loading sport: mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
 [gear] sport loaded in 12.3s
 ```
 
@@ -392,9 +392,9 @@ Switch between model profiles at runtime without restarting the server. Think of
 
 | Gear | Model | Size | Active Params | Best For |
 |------|-------|------|---------------|----------|
-| **eco** | `Qwen3-8B-4bit` | ~5GB | 8B | Fast, simple tasks (git status, npm install) |
-| **sport** | `Qwen3-30B-A3B-4bit` | ~17GB | ~3B (MoE) | Balanced — default for most CLI work |
-| **track** | `Qwen2.5-Coder-32B-Instruct-4bit` | ~18GB | 32B | Complex local tasks needing strong code understanding |
+| **eco** | `Qwen3.5-9B-MLX-4bit` | ~5GB | 9B | Fast, simple tasks (git status, npm install) |
+| **sport** | `Qwen3-Coder-30B-A3B-Instruct-4bit` | ~17GB | ~3B (MoE) | Balanced — default for most CLI work |
+| **track** | `Qwen3-Coder-Next-4bit` | ~45GB | ~3B (MoE) | Complex local tasks needing strong code understanding |
 
 **sport** is the default. It uses a Mixture-of-Experts architecture — 30B total parameters but only ~3B active per token, giving you large-model knowledge with small-model speed.
 
@@ -426,7 +426,7 @@ Override any gear's model via environment variable:
 ```bash
 # In ~/.config/mlx-task-router/.env
 GEAR_ECO_MODEL=mlx-community/Qwen3-4B-4bit
-GEAR_SPORT_MODEL=mlx-community/Qwen3-30B-A3B-4bit
+GEAR_SPORT_MODEL=mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
 GEAR_TRACK_MODEL=mlx-community/Codestral-22B-v0.1-4bit
 ```
 
@@ -691,9 +691,9 @@ All settings are configured via `~/.config/mlx-task-router/.env` or as environme
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DEFAULT_GEAR` | `sport` | Gear profile to load on startup (`eco`, `sport`, or `track`). |
-| `GEAR_ECO_MODEL` | `mlx-community/Qwen3-8B-4bit` | Model for the eco gear. |
-| `GEAR_SPORT_MODEL` | `mlx-community/Qwen3-30B-A3B-4bit` | Model for the sport gear. |
-| `GEAR_TRACK_MODEL` | `mlx-community/Qwen2.5-Coder-32B-Instruct-4bit` | Model for the track gear. |
+| `GEAR_ECO_MODEL` | `mlx-community/Qwen3.5-9B-MLX-4bit` | Model for the eco gear. |
+| `GEAR_SPORT_MODEL` | `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` | Model for the sport gear. |
+| `GEAR_TRACK_MODEL` | `mlx-community/Qwen3-Coder-Next-4bit` | Model for the track gear. |
 
 ### Routing Settings
 
