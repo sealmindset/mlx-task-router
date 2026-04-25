@@ -31,6 +31,38 @@ Respond with tool calls using the <tool_call> format when you need to execute ac
 """
 
 
+def _build_sampling_args() -> tuple[Any, list[Any]]:
+    """Build sampler and logits_processors for mlx-lm >= 0.31.
+
+    In mlx-lm 0.31+, generate_step() no longer accepts temp/top_p/top_k/
+    repetition_penalty as kwargs. Instead it takes a `sampler` callable and
+    a `logits_processors` list, built via sample_utils helpers.
+    """
+    sampler = None
+    logits_processors: list[Any] = []
+    try:
+        from mlx_lm.sample_utils import make_sampler, make_logits_processors
+
+        sampler = make_sampler(
+            temp=config.temperature,
+            top_p=config.top_p if config.top_p < 1.0 else None,
+            top_k=config.top_k if config.top_k > 0 else 0,
+        )
+        if config.repetition_penalty > 1.0:
+            logits_processors = make_logits_processors(
+                repetition_penalty=config.repetition_penalty,
+                repetition_context_size=256,
+            )
+        print(
+            f"[sampling] Using mlx-lm sampler: temp={config.temperature}, "
+            f"top_p={config.top_p}, top_k={config.top_k}, "
+            f"rep_penalty={config.repetition_penalty}"
+        )
+    except ImportError:
+        print("[sampling] mlx_lm.sample_utils not available — using legacy kwargs")
+    return sampler, logits_processors
+
+
 class ModelManager:
     def __init__(self):
         self._model = None
@@ -151,19 +183,17 @@ class ModelManager:
             config.model_max_tokens,
         )
 
+        sampler, logits_processors = _build_sampling_args()
+
         gen_kwargs: dict[str, Any] = {
             "prompt": prompt,
             "max_tokens": max_tokens,
             "verbose": False,
         }
-        if config.temperature > 0:
-            gen_kwargs["temp"] = config.temperature
-        if config.top_p < 1.0:
-            gen_kwargs["top_p"] = config.top_p
-        if config.top_k > 0:
-            gen_kwargs["top_k"] = config.top_k
-        if config.repetition_penalty > 1.0:
-            gen_kwargs["repetition_penalty"] = config.repetition_penalty
+        if sampler is not None:
+            gen_kwargs["sampler"] = sampler
+        if logits_processors:
+            gen_kwargs["logits_processors"] = logits_processors
         if self._draft_model is not None:
             gen_kwargs["draft_model"] = self._draft_model
             gen_kwargs["num_draft_tokens"] = config.speculative_tokens
@@ -247,18 +277,16 @@ class ModelManager:
         input_tokens = self._count_tokens(prompt)
         response_id = f"msg_local_{int(time.time() * 1000)}"
 
+        sampler, logits_processors = _build_sampling_args()
+
         stream_kwargs: dict[str, Any] = {
             "prompt": prompt,
             "max_tokens": max_tokens,
         }
-        if config.temperature > 0:
-            stream_kwargs["temp"] = config.temperature
-        if config.top_p < 1.0:
-            stream_kwargs["top_p"] = config.top_p
-        if config.top_k > 0:
-            stream_kwargs["top_k"] = config.top_k
-        if config.repetition_penalty > 1.0:
-            stream_kwargs["repetition_penalty"] = config.repetition_penalty
+        if sampler is not None:
+            stream_kwargs["sampler"] = sampler
+        if logits_processors:
+            stream_kwargs["logits_processors"] = logits_processors
 
         # Emit message_start
         yield _sse(

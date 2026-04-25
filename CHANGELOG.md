@@ -26,6 +26,7 @@ Live web UI at `GET /dashboard` — no npm, no build step, served inline by Fast
 
 ### Bug Fixes
 
+- **Critical: mlx-lm 0.31 API incompatibility** — `generate_step()` in mlx-lm 0.31+ no longer accepts `temp`, `top_p`, `top_k`, `repetition_penalty` as direct kwargs. Every local generation attempt crashed with `generate_step() got an unexpected keyword argument 'temp'`, silently falling back to Claude API. Fixed by building proper `sampler` (via `make_sampler()`) and `logits_processors` (via `make_logits_processors()`) objects from `mlx_lm.sample_utils`.
 - **Streaming cost savings not recorded** — `stats.record_local()` was only called in the non-streaming path of `_handle_local`. Claude Code uses streaming exclusively, so all locally-handled requests showed $0.00 cost savings. Fixed by adding `stats.record_local()` to the streaming path alongside `perf_metrics.record()`.
 - **`mlx-router-ctl status`** — fixed garbled Requests line (`requests_forward` → `requests_forwarded`)
 
@@ -37,7 +38,8 @@ Live web UI at `GET /dashboard` — no npm, no build step, served inline by Fast
 ### Files Changed
 - `session_stats.py` — **new** — SessionTracker + SessionStats classes
 - `dashboard.py` — **new** — HTML template + APIRouter
-- `server.py` — session tracking wired into /v1/messages, session + dashboard endpoints
+- `local.py` — replaced raw temp/top_p/top_k/repetition_penalty kwargs with sampler + logits_processors for mlx-lm 0.31+
+- `server.py` — session tracking wired into /v1/messages, session + dashboard endpoints, streaming stats fix
 - `test_session_stats.py` — **new** — 24 tests
 - `test_server.py` — +10 tests (7 session, 3 dashboard)
 - `install.sh` — bug fix in status display
