@@ -392,7 +392,7 @@ Switch between model profiles at runtime without restarting the server. Think of
 
 | Gear | Model | Size | Active Params | Best For |
 |------|-------|------|---------------|----------|
-| **eco** | `Qwen3.5-9B-MLX-4bit` | ~5GB | 9B | Fast, simple tasks (git status, npm install) |
+| **eco** | `Qwen2.5-Coder-7B-Instruct-4bit` | ~4GB | 7B | Fast, simple code tasks (git status, npm install) |
 | **sport** | `Qwen3-Coder-30B-A3B-Instruct-4bit` | ~17GB | ~3B (MoE) | Balanced — default for most CLI work |
 | **track** | `Qwen3-Coder-Next-4bit` | ~45GB | ~3B (MoE) | Complex local tasks needing strong code understanding |
 
@@ -425,7 +425,7 @@ Override any gear's model via environment variable:
 
 ```bash
 # In ~/.config/mlx-task-router/.env
-GEAR_ECO_MODEL=mlx-community/Qwen3-4B-4bit
+GEAR_ECO_MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 GEAR_SPORT_MODEL=mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
 GEAR_TRACK_MODEL=mlx-community/Codestral-22B-v0.1-4bit
 ```
@@ -691,7 +691,7 @@ All settings are configured via `~/.config/mlx-task-router/.env` or as environme
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DEFAULT_GEAR` | `sport` | Gear profile to load on startup (`eco`, `sport`, or `track`). |
-| `GEAR_ECO_MODEL` | `mlx-community/Qwen3.5-9B-MLX-4bit` | Model for the eco gear. |
+| `GEAR_ECO_MODEL` | `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit` | Model for the eco gear. |
 | `GEAR_SPORT_MODEL` | `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` | Model for the sport gear. |
 | `GEAR_TRACK_MODEL` | `mlx-community/Qwen3-Coder-Next-4bit` | Model for the track gear. |
 

@@ -11,7 +11,7 @@
 
 ## Routing Quality
 
-- [ ] Confidence scoring — score routing confidence instead of binary local/forward; only route locally above a threshold
+- [x] Confidence scoring — score routing confidence instead of binary local/forward; only route locally above a threshold
 - [x] Response quality feedback loop — tracks trigger success/failure rates, applies score penalty to unreliable triggers
 
 ## Cost Savings

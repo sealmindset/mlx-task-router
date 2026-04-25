@@ -33,8 +33,8 @@ class GearProfile:
 DEFAULT_GEARS: dict[str, GearProfile] = {
     "eco": GearProfile(
         name="eco",
-        model="mlx-community/Qwen3.5-9B-MLX-4bit",
-        description="Fast and light — simple tasks",
+        model="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+        description="Fast and light — simple code tasks",
         max_tokens=4096,
     ),
     "sport": GearProfile(
