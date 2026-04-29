@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.7.0] — 2026-04-29
+
+### Model Upgrade: Qwen3.6-27B-OptiQ-4bit
+
+Default model switched from `mlx-community/Qwen3-Coder-Next-4bit` (MoE 80B/3B) to `mlx-community/Qwen3.6-27B-OptiQ-4bit` (Dense 27B).
+
+**Why:**
+- **SWE-bench Verified: 77.2%** (was 70.6%) — +6.6% improvement
+- **Terminal-Bench 2.0: 59.3%** — matches Claude 4.5 Opus exactly
+- **~2x faster inference** — dense 27B vs MoE 80B on Apple Silicon
+- **~18GB VRAM** (was ~48GB) — runs on 32GB+ machines, frees memory for other workloads
+- **Thinking Preservation** — retains reasoning across multi-turn agent sessions
+- **128K native context** — sufficient for nearly all coding sessions
+- **Compatible with stock mlx-lm** — no special dependencies needed
+
+**Sampling params updated:**
+- `MLX_TEMPERATURE`: 1.0 → 0.6
+- `MLX_TOP_K`: 40 → 20
+- `MLX_TOP_P`: 0.95 (unchanged)
+
+### Files Changed
+- `config.py` — DEFAULT_MODEL updated
+- `.env.example` — model, sampling docs, and comments updated
+- `README.md` — configuration reference tables updated
+
+---
+
 ## [0.6.1] — 2026-04-25
 
 ### Per-Session Stats

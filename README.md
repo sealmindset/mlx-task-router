@@ -810,16 +810,16 @@ All settings are configured via `~/.config/mlx-task-router/.env` or as environme
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MLX_MODEL` | `mlx-community/Qwen3-Coder-Next-4bit` | MLX model to load at startup (any HuggingFace path from [mlx-community](https://huggingface.co/mlx-community)). Qwen3-Coder-Next: MoE 80B/3B-active, purpose-built for IDE agentic coding (SWE-bench 70.6%). Requires 128GB. |
+| `MLX_MODEL` | `mlx-community/Qwen3.6-27B-OptiQ-4bit` | MLX model to load at startup (any HuggingFace path from [mlx-community](https://huggingface.co/mlx-community)). Qwen3.6-27B: Dense 27B, SWE-bench Verified 77.2%, Terminal-Bench 2.0 59.3% (= Claude 4.5 Opus). ~18GB, runs on 32GB+ machines. |
 | `MLX_MAX_TOKENS` | `16384` | Maximum tokens the local model can generate per response. |
 
 ### Generation Settings
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MLX_TEMPERATURE` | `1.0` | Sampling temperature. Qwen3-Coder-Next best practice: 1.0 — DO NOT use 0.0. |
-| `MLX_TOP_P` | `0.95` | Nucleus sampling threshold. Qwen3-Coder-Next best practice: 0.95. |
-| `MLX_TOP_K` | `40` | Top-K sampling. Qwen3-Coder-Next best practice: 40. |
+| `MLX_TEMPERATURE` | `0.6` | Sampling temperature. Qwen3.6-27B best practice: 0.6. |
+| `MLX_TOP_P` | `0.95` | Nucleus sampling threshold. Qwen3.6-27B best practice: 0.95. |
+| `MLX_TOP_K` | `20` | Top-K sampling. Qwen3.6-27B best practice: 20. |
 | `MLX_REPETITION_PENALTY` | `1.05` | Prevents degenerate repetition loops in model output. |
 | `MLX_GENERATION_TIMEOUT` | `120` | Seconds before local generation times out and fails over to Claude. |
 
@@ -836,7 +836,7 @@ Speculative decoding uses a small draft model to predict tokens, then verifies t
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MAX_LOCAL_CONTEXT_TOKENS` | `65536` | Requests with estimated context above this are forwarded to Anthropic. Qwen3-Coder-Next supports 256K native; 64K is conservative for 128GB machines. |
+| `MAX_LOCAL_CONTEXT_TOKENS` | `65536` | Requests with estimated context above this are forwarded to Anthropic. Qwen3.6-27B supports 128K native; 64K is a conservative default. |
 | `ROUTING_THRESHOLD` | `0.5` | Forward threshold: requests with forward_score ≥ this value go to Claude. Higher = more stays local (aggressive). |
 | `ADAPTIVE_ROUTING` | `true` | Auto-calibrate threshold from feedback data. Raises threshold when local success rate is high (keep more local), lowers it on high failure rate. |
 | `LOG_ROUTING` | `true` | Print routing decisions to stdout for debugging. |

@@ -5,7 +5,7 @@ from mlx_task_router.config import DEFAULT_MAX_TOKENS, DEFAULT_MODEL, Config
 
 class TestConfigDefaults:
     def test_default_model(self):
-        assert DEFAULT_MODEL == "mlx-community/Qwen3-Coder-Next-4bit"
+        assert DEFAULT_MODEL == "mlx-community/Qwen3.6-27B-OptiQ-4bit"
 
     def test_default_max_tokens(self):
         assert DEFAULT_MAX_TOKENS == 16384
@@ -17,9 +17,9 @@ class TestConfigDefaults:
 
     def test_generation_defaults(self):
         c = Config()
-        assert c.temperature == 1.0
+        assert c.temperature == 0.6
         assert c.top_p == 0.95
-        assert c.top_k == 40
+        assert c.top_k == 20
         assert c.repetition_penalty == 1.05
         assert c.draft_model == ""
         assert c.speculative_tokens == 5

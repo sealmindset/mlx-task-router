@@ -22,7 +22,7 @@ def _load_dotenv_once():
     load_dotenv()
 
 
-DEFAULT_MODEL = "mlx-community/Qwen3-Coder-Next-4bit"
+DEFAULT_MODEL = "mlx-community/Qwen3.6-27B-OptiQ-4bit"
 DEFAULT_MAX_TOKENS = 16384
 
 
@@ -54,11 +54,11 @@ class Config:
             os.getenv("MLX_MAX_TOKENS", str(DEFAULT_MAX_TOKENS))
         )
         if self.temperature < 0:
-            self.temperature = float(os.getenv("MLX_TEMPERATURE", "1.0"))
+            self.temperature = float(os.getenv("MLX_TEMPERATURE", "0.6"))
         if self.top_p < 0:
             self.top_p = float(os.getenv("MLX_TOP_P", "0.95"))
         if self.top_k < 0:
-            self.top_k = int(os.getenv("MLX_TOP_K", "40"))
+            self.top_k = int(os.getenv("MLX_TOP_K", "20"))
         if self.repetition_penalty < 0:
             self.repetition_penalty = float(os.getenv("MLX_REPETITION_PENALTY", "1.05"))
         self.draft_model = self.draft_model or os.getenv("MLX_DRAFT_MODEL", "")
@@ -101,9 +101,9 @@ class Config:
 
         self.model_name = os.getenv("MLX_MODEL", DEFAULT_MODEL)
         self.model_max_tokens = int(os.getenv("MLX_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
-        self.temperature = float(os.getenv("MLX_TEMPERATURE", "1.0"))
+        self.temperature = float(os.getenv("MLX_TEMPERATURE", "0.6"))
         self.top_p = float(os.getenv("MLX_TOP_P", "0.95"))
-        self.top_k = int(os.getenv("MLX_TOP_K", "40"))
+        self.top_k = int(os.getenv("MLX_TOP_K", "20"))
         self.repetition_penalty = float(os.getenv("MLX_REPETITION_PENALTY", "1.05"))
         self.routing_threshold = float(os.getenv("ROUTING_THRESHOLD", "0.5"))
         self.adaptive_routing = os.getenv("ADAPTIVE_ROUTING", "true").lower() == "true"
