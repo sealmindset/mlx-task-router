@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import json
+import threading
 import time
 from typing import Any, Generator
 
@@ -72,6 +73,10 @@ class ModelManager:
         self._loading = False
         self._system_prompt_cache: dict[str, str] = {}
         self._system_prompt_tokens_cache: dict[str, int] = {}
+        self._sampler = None
+        self._logits_processors: list[Any] = []
+        self._prompt_cache = None
+        self._cache_lock = threading.Lock()
 
     @property
     def is_loaded(self) -> bool:
@@ -113,9 +118,20 @@ class ModelManager:
                     print(f"[model] Draft model failed (non-fatal): {e}")
                     self._draft_model = None
 
+            self._sampler, self._logits_processors = _build_sampling_args()
+            self._init_prompt_cache()
+            self._init_embed_router(model_name)
             self._warmup()
         finally:
             self._loading = False
+
+    def _init_embed_router(self, model_name: str) -> None:
+        """Attach model to embedding router for semantic routing signals."""
+        try:
+            from mlx_task_router.embed_router import embed_router
+            embed_router.attach_model(self._model, self._tokenizer, model_name)
+        except Exception as e:
+            print(f"[model] Embed router init failed (non-fatal): {e}")
 
     def _warmup(self) -> None:
         """Prime Metal shader cache with a short generation."""
@@ -135,11 +151,27 @@ class ModelManager:
         except Exception as e:
             print(f"[model] Warmup failed (non-fatal): {e}")
 
+    def _init_prompt_cache(self) -> None:
+        """Initialize prompt cache for KV-cache reuse across turns."""
+        try:
+            from mlx_lm import make_prompt_cache
+            self._prompt_cache = make_prompt_cache(self._model)
+            print("[model] Prompt cache initialized — KV-cache reuse enabled")
+        except (ImportError, TypeError, Exception) as e:
+            self._prompt_cache = None
+            print(f"[model] Prompt cache not available (non-fatal): {e}")
+
     def unload(self) -> None:
+        try:
+            from mlx_task_router.embed_router import embed_router
+            embed_router.detach_model()
+        except Exception:
+            pass
         self._model = None
         self._tokenizer = None
         self._draft_model = None
         self._model_name = None
+        self._prompt_cache = None
         gc.collect()
 
     def generate(
@@ -183,26 +215,27 @@ class ModelManager:
             config.model_max_tokens,
         )
 
-        sampler, logits_processors = _build_sampling_args()
-
         gen_kwargs: dict[str, Any] = {
             "prompt": prompt,
             "max_tokens": max_tokens,
             "verbose": False,
         }
-        if sampler is not None:
-            gen_kwargs["sampler"] = sampler
-        if logits_processors:
-            gen_kwargs["logits_processors"] = logits_processors
+        if self._sampler is not None:
+            gen_kwargs["sampler"] = self._sampler
+        if self._logits_processors:
+            gen_kwargs["logits_processors"] = self._logits_processors
         if self._draft_model is not None:
             gen_kwargs["draft_model"] = self._draft_model
             gen_kwargs["num_draft_tokens"] = config.speculative_tokens
+        if self._prompt_cache is not None:
+            gen_kwargs["prompt_cache"] = self._prompt_cache
 
-        response_text = mlx_generate(
-            self._model,
-            self._tokenizer,
-            **gen_kwargs,
-        )
+        with self._cache_lock:
+            response_text = mlx_generate(
+                self._model,
+                self._tokenizer,
+                **gen_kwargs,
+            )
 
         text, tool_calls = parse_model_response(response_text)
         content = build_anthropic_content(text, tool_calls)
@@ -277,16 +310,16 @@ class ModelManager:
         input_tokens = self._count_tokens(prompt)
         response_id = f"msg_local_{int(time.time() * 1000)}"
 
-        sampler, logits_processors = _build_sampling_args()
-
         stream_kwargs: dict[str, Any] = {
             "prompt": prompt,
             "max_tokens": max_tokens,
         }
-        if sampler is not None:
-            stream_kwargs["sampler"] = sampler
-        if logits_processors:
-            stream_kwargs["logits_processors"] = logits_processors
+        if self._sampler is not None:
+            stream_kwargs["sampler"] = self._sampler
+        if self._logits_processors:
+            stream_kwargs["logits_processors"] = self._logits_processors
+        if self._prompt_cache is not None:
+            stream_kwargs["prompt_cache"] = self._prompt_cache
 
         # Emit message_start
         yield _sse(
@@ -326,56 +359,57 @@ class ModelManager:
         tool_tag_end = "</tool_call>"
         output_tokens = 0
 
-        for chunk in mlx_stream(
-            self._model,
-            self._tokenizer,
-            **stream_kwargs,
-        ):
-            token = chunk.text
-            full_text += token
+        with self._cache_lock:
+            for chunk in mlx_stream(
+                self._model,
+                self._tokenizer,
+                **stream_kwargs,
+            ):
+                token = chunk.text
+                full_text += token
 
-            if in_tool_call:
-                # Buffering tool call content
-                tool_buffer += token
-                if tool_tag_end in tool_buffer:
-                    in_tool_call = False
-                continue
+                if in_tool_call:
+                    # Buffering tool call content
+                    tool_buffer += token
+                    if tool_tag_end in tool_buffer:
+                        in_tool_call = False
+                    continue
 
-            # Check if we're entering a tool_call tag
-            text_buffer += token
-            if "<tool_call>" in text_buffer:
-                # Flush any text before the tag
-                before_tag = text_buffer.split("<tool_call>", 1)[0]
-                if before_tag:
+                # Check if we're entering a tool_call tag
+                text_buffer += token
+                if "<tool_call>" in text_buffer:
+                    # Flush any text before the tag
+                    before_tag = text_buffer.split("<tool_call>", 1)[0]
+                    if before_tag:
+                        yield _sse(
+                            "content_block_delta",
+                            {"type": "content_block_delta", "index": 0,
+                             "delta": {"type": "text_delta", "text": before_tag}},
+                        )
+                    in_tool_call = True
+                    tool_buffer = text_buffer.split("<tool_call>", 1)[1]
+                    text_buffer = ""
+                    if tool_tag_end in tool_buffer:
+                        in_tool_call = False
+                    continue
+
+                # Check for partial tag prefix at end of buffer (e.g. "<tool" or "<to")
+                # to avoid emitting incomplete tags
+                flush_up_to = len(text_buffer)
+                for i in range(1, min(len(tool_tag_prefix) + 1, len(text_buffer) + 1)):
+                    suffix = text_buffer[-i:]
+                    if tool_tag_prefix.startswith(suffix):
+                        flush_up_to = len(text_buffer) - i
+                        break
+
+                if flush_up_to > 0:
+                    to_emit = text_buffer[:flush_up_to]
+                    text_buffer = text_buffer[flush_up_to:]
                     yield _sse(
                         "content_block_delta",
                         {"type": "content_block_delta", "index": 0,
-                         "delta": {"type": "text_delta", "text": before_tag}},
+                         "delta": {"type": "text_delta", "text": to_emit}},
                     )
-                in_tool_call = True
-                tool_buffer = text_buffer.split("<tool_call>", 1)[1]
-                text_buffer = ""
-                if tool_tag_end in tool_buffer:
-                    in_tool_call = False
-                continue
-
-            # Check for partial tag prefix at end of buffer (e.g. "<tool" or "<to")
-            # to avoid emitting incomplete tags
-            flush_up_to = len(text_buffer)
-            for i in range(1, min(len(tool_tag_prefix) + 1, len(text_buffer) + 1)):
-                suffix = text_buffer[-i:]
-                if tool_tag_prefix.startswith(suffix):
-                    flush_up_to = len(text_buffer) - i
-                    break
-
-            if flush_up_to > 0:
-                to_emit = text_buffer[:flush_up_to]
-                text_buffer = text_buffer[flush_up_to:]
-                yield _sse(
-                    "content_block_delta",
-                    {"type": "content_block_delta", "index": 0,
-                     "delta": {"type": "text_delta", "text": to_emit}},
-                )
 
         # Flush remaining text buffer
         if text_buffer:

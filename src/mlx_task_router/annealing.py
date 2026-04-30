@@ -125,6 +125,16 @@ class WeightAnnealer:
                 self._save()
                 print(f"[annealing] Adjusted weights: {adjustments_made}")
 
+        # Trigger embed router probe retraining periodically
+        try:
+            from mlx_task_router.embed_router import embed_router
+            sample_count = embed_router.training_sample_count()
+            from mlx_task_router.config import config as _cfg
+            if sample_count >= _cfg.embed_min_samples and total_attempts % 50 == 0:
+                embed_router.train()
+        except Exception as e:
+            print(f"[annealing] Embed probe retrain failed (non-fatal): {e}")
+
     def get_adjustment(self, signal_category: str) -> float:
         """Get the current weight adjustment for a signal category."""
         with self._lock:

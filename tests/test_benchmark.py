@@ -33,6 +33,15 @@ def _expected_route(item: dict[str, str]) -> str:
     return Route.LOCAL if item["expected_route"] == "local" else Route.FORWARD
 
 
+def _routes_match(actual: str, expected: str) -> bool:
+    """Check if actual route matches expected. FAST counts as LOCAL."""
+    if actual == expected:
+        return True
+    if expected == Route.LOCAL and actual == Route.FAST:
+        return True
+    return False
+
+
 class TestRoutingBenchmark:
     """Test routing accuracy against labeled benchmark fixtures."""
 
@@ -52,7 +61,7 @@ class TestRoutingBenchmark:
         assert FIXTURE_PATH.exists(), f"Benchmark fixture not found: {FIXTURE_PATH}"
 
     def test_fixture_has_entries(self, fixtures):
-        assert len(fixtures) >= 50, f"Expected at least 50 fixtures, got {len(fixtures)}"
+        assert len(fixtures) >= 53, f"Expected at least 53 fixtures, got {len(fixtures)}"
 
     def test_all_entries_have_required_fields(self, fixtures):
         for i, item in enumerate(fixtures):
@@ -72,7 +81,7 @@ class TestRoutingBenchmark:
             route, reason, _ = classify(request, model_loaded=True)
             expected = _expected_route(item)
 
-            if route == expected:
+            if _routes_match(route, expected):
                 correct += 1
             else:
                 failures.append({
@@ -107,7 +116,7 @@ class TestRoutingBenchmark:
         cli_items = [f for f in fixtures if f.get("category") == "cli"]
         correct = sum(
             1 for item in cli_items
-            if classify(_make_request(item["text"]), model_loaded=True)[0] == Route.LOCAL
+            if classify(_make_request(item["text"]), model_loaded=True)[0] in (Route.LOCAL, Route.FAST)
         )
         accuracy = correct / len(cli_items) * 100 if cli_items else 0
         assert accuracy >= 80.0, f"CLI accuracy {accuracy:.1f}% below 80%"
@@ -117,20 +126,30 @@ class TestRoutingBenchmark:
         neutral_items = [f for f in fixtures if f.get("category") == "neutral"]
         correct = sum(
             1 for item in neutral_items
-            if classify(_make_request(item["text"]), model_loaded=True)[0] == Route.LOCAL
+            if classify(_make_request(item["text"]), model_loaded=True)[0] in (Route.LOCAL, Route.FAST)
         )
         accuracy = correct / len(neutral_items) * 100 if neutral_items else 0
         assert accuracy >= 90.0, f"Neutral accuracy {accuracy:.1f}% below 90%"
 
-    def test_complex_category_accuracy(self, fixtures):
-        """Complex tasks should have high forward routing accuracy."""
+    def test_complex_category_stays_local(self, fixtures):
+        """Single-signal complex tasks stay local — Qwen3.6-27B handles these."""
         complex_items = [f for f in fixtures if f.get("category") == "complex"]
         correct = sum(
             1 for item in complex_items
-            if classify(_make_request(item["text"]), model_loaded=True)[0] == Route.FORWARD
+            if classify(_make_request(item["text"]), model_loaded=True)[0] in (Route.LOCAL, Route.FAST)
         )
         accuracy = correct / len(complex_items) * 100 if complex_items else 0
-        assert accuracy >= 80.0, f"Complex accuracy {accuracy:.1f}% below 80%"
+        assert accuracy >= 80.0, f"Complex-local accuracy {accuracy:.1f}% below 80%"
+
+    def test_complex_multi_category_forwards(self, fixtures):
+        """Multi-signal complex tasks (stacked signals) forward to Opus."""
+        multi_items = [f for f in fixtures if f.get("category") == "complex_multi"]
+        correct = sum(
+            1 for item in multi_items
+            if classify(_make_request(item["text"]), model_loaded=True)[0] == Route.FORWARD
+        )
+        accuracy = correct / len(multi_items) * 100 if multi_items else 0
+        assert accuracy >= 80.0, f"Complex-multi accuracy {accuracy:.1f}% below 80%"
 
     def test_overrides_always_correct(self, fixtures):
         """@cloud/@local overrides must be 100% correct."""

@@ -779,6 +779,50 @@ mlx-router init
 | `GET` | `/feedback` | Per-trigger reliability stats and penalties |
 | `POST` | `/feedback/reset` | Clear all feedback data |
 
+### Routing Intelligence
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/routing/history` | Recent routing decisions (route, score, trigger, preview) |
+| `GET` | `/routing/summary` | Aggregated routing breakdown by category |
+| `GET` | `/annealing` | Self-annealing status — weight adjustments, learning rate, history |
+| `POST` | `/annealing/reset` | Reset all annealing adjustments to baseline |
+| `GET` | `/embed` | Embedding router status — probe readiness, training samples, model hash |
+| `GET` | `/pool` | Model pool status — main/fast model availability and configuration |
+
+### Sessions
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/sessions` | List recent sessions with routing breakdown |
+| `GET` | `/sessions/current` | Current active session details |
+| `GET` | `/sessions/summary` | Session count and activity summary |
+| `GET` | `/sessions/{id}` | Specific session by ID |
+| `POST` | `/sessions/clear` | Clear all session data |
+
+### Trust-But-Verify (TBV)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/verify` | TBV status — enabled, mode, adaptive sample rate, pass rate, queue depth |
+| `GET` | `/verify/results` | Recent verification results with scores (limit param) |
+| `GET` | `/verify/adjustments` | Current router adjustments from verification feedback |
+| `POST` | `/verify/enable` | Toggle TBV or shadow mode: `{"enabled": true, "shadow": false}` |
+| `POST` | `/verify/reset` | Clear all verification data and tuner adjustments |
+
+### Quality Assurance Gate
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/qa` | QA status — overall quality score, confidence interval, gate stats, cost |
+| `GET` | `/qa/categories` | Per-category trust levels with evidence and confidence intervals |
+| `GET` | `/qa/evidence` | Recent validation evidence across all categories |
+| `GET` | `/qa/failures` | Categories with failures (for debugging) |
+| `POST` | `/qa/enable` | Toggle QA gate: `{"enabled": true}` |
+| `POST` | `/qa/reset` | Clear all trust evidence and reset categories |
+| `GET` | `/qa/cost` | Cost analysis — gate hits, shadow tokens, estimated spend |
+| `GET` | `/qa/dashboard` | Visual evidence dashboard with charts and per-category proof |
+
 ### Operations
 
 | Method | Endpoint | Description |
@@ -786,6 +830,9 @@ mlx-router init
 | `GET` | `/health` | Health check — model status, model health, loading state |
 | `GET` | `/watchdog` | Watchdog status — healthy, recovering, failures, last error |
 | `GET` | `/perf` | Performance metrics — latency percentiles, tokens/sec, request counts |
+| `GET` | `/config` | Current configuration values |
+| `POST` | `/config/reload` | Reload configuration from `.env` file (hot reload) |
+| `GET` | `/dashboard` | Live web dashboard with charts and session tracking |
 | `GET` | `/` | Server info — version, model status, cost saved |
 
 ## Configuration Reference
@@ -837,9 +884,52 @@ Speculative decoding uses a small draft model to predict tokens, then verifies t
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MAX_LOCAL_CONTEXT_TOKENS` | `65536` | Requests with estimated context above this are forwarded to Anthropic. Qwen3.6-27B supports 128K native; 64K is a conservative default. |
-| `ROUTING_THRESHOLD` | `0.5` | Forward threshold: requests with forward_score ≥ this value go to Claude. Higher = more stays local (aggressive). |
+| `ROUTING_THRESHOLD` | `0.7` | Forward threshold: requests with forward_score ≥ this value go to Claude. Tuned for Qwen3.6-27B — single signals stay local, only stacked signals forward. |
 | `ADAPTIVE_ROUTING` | `true` | Auto-calibrate threshold from feedback data. Raises threshold when local success rate is high (keep more local), lowers it on high failure rate. |
 | `LOG_ROUTING` | `true` | Print routing decisions to stdout for debugging. |
+
+### Embedding Routing Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMBED_ROUTING` | `true` | Enable embedding-based semantic routing. Uses the local model's embedding layer to classify request difficulty, augmenting regex heuristics. |
+| `EMBED_WEIGHT` | `0.3` | Weight applied to embedding classifier score in forward scoring (0.0–1.0). Higher values increase the influence of the semantic signal. |
+| `EMBED_MIN_SAMPLES` | `100` | Minimum training examples required before the linear probe is activated. Until this threshold, only regex heuristics are used. |
+
+### Multi-Model Pool Settings (Optional)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MLX_FAST_MODEL` | `""` | Small fast model for trivial requests (git commands, simple edits). Leave empty to disable — all local requests go to the main model. Example: `mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit` |
+| `FAST_MODEL_MAX_TOKENS` | `2048` | Maximum tokens for fast model responses. Kept small since trivial tasks need short answers. |
+| `TRIVIAL_THRESHOLD` | `0.3` | Forward score must be below this for a request to be classified as trivial. Prevents routing complex requests to the fast model. |
+
+### Trust-But-Verify (TBV) Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VERIFY_ENABLED` | `false` | Enable TBV system. Spot-checks routing decisions using Claude as ground-truth validator. Runs async with zero latency impact. |
+| `VERIFY_SAMPLE_RATE` | `0.0` | Fixed sample rate override (0.0 = use adaptive rate which auto-adjusts 5%–30% based on pass rate and history). |
+| `VERIFY_SHADOW_MODE` | `false` | Enable shadow mode: dual-generates (local + Claude) for sampled requests to directly compare outputs. Higher cost but strongest signal. |
+| `VERIFY_MODEL` | `claude-sonnet-4-20250514` | Model used for verification judgments. Must be a Claude model accessible via your API key. |
+| `VERIFY_QUEUE_SIZE` | `50` | Maximum pending verification tasks. Excess tasks are dropped (not blocked). |
+| `VERIFY_AUTO_TUNE` | `true` | Allow TBV results to dynamically adjust routing signal weights and thresholds. Adjustments are bounded (±0.3 max) and decay over time. |
+| `VERIFY_MIN_SCORE` | `3` | Minimum acceptable score per rubric axis (1–5 scale). Responses scoring below this on any axis are considered failures. |
+| `VERIFY_ALERT_WEBHOOK` | `""` | URL to POST alerts when pass rate drops below 85%. Empty = disabled. |
+
+### Quality Assurance Gate Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `QA_GATE_ENABLED` | `false` | Enable confidence-gated routing. Uncertain requests are shadow-validated before delivery. |
+| `QA_GATE_LOWER` | `0.3` | Forward score below this = confident local (bypass gate). |
+| `QA_GATE_UPPER` | `0.7` | Forward score above this = confident forward (send to Claude). |
+| `QA_GATE_TIMEOUT` | `10` | Seconds to wait for parallel local + Claude generation. |
+| `QA_GATE_VALIDATION_MODEL` | `claude-sonnet-4-20250514` | Model used for equivalence validation. |
+| `QA_TRUST_MIN_SAMPLES` | `50` | Samples needed for a category to reach Trusted level (narrows gate). |
+| `QA_TRUST_PROVEN_SAMPLES` | `100` | Samples needed for Proven level (bypasses gate entirely). |
+| `QA_TRUST_PASS_THRESHOLD` | `0.95` | Pass rate required for Trusted status. |
+| `QA_TRUST_PROVEN_THRESHOLD` | `0.98` | Pass rate required for Proven status. |
 
 ### Cache Settings
 

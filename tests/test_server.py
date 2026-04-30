@@ -445,6 +445,32 @@ class TestAnnealingEndpoints:
 
 
 # ---------------------------------------------------------------------------
+# Tests — Embed Router Endpoints
+# ---------------------------------------------------------------------------
+
+class TestEmbedEndpoints:
+    def test_embed_status(self, client):
+        resp = client.get("/embed")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "ready" in data
+        assert "enabled" in data
+        assert "training_samples" in data
+
+
+# ---------------------------------------------------------------------------
+# Tests — Model Pool Endpoints
+# ---------------------------------------------------------------------------
+
+class TestPoolEndpoints:
+    def test_pool_status(self, client):
+        resp = client.get("/pool")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "main_loaded" in data or "status" in data
+
+
+# ---------------------------------------------------------------------------
 # Tests — Session Stats Endpoints
 # ---------------------------------------------------------------------------
 
@@ -511,6 +537,45 @@ class TestSessionEndpoints:
 
 
 # ---------------------------------------------------------------------------
+# Tests — Trust-But-Verify Endpoints
+# ---------------------------------------------------------------------------
+
+class TestVerifyEndpoints:
+    def test_verify_status(self, client):
+        resp = client.get("/verify")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "enabled" in data
+        assert "pass_rate" in data
+        assert "total_verified" in data
+
+    def test_verify_results_empty(self, client):
+        resp = client.get("/verify/results")
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_verify_adjustments(self, client):
+        resp = client.get("/verify/adjustments")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "enabled" in data
+        assert "adjustments" in data
+        assert "total_processed" in data
+
+    def test_verify_enable_disable(self, client):
+        resp = client.post("/verify/enable", json={"enabled": False, "shadow": False})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "updated"
+        assert data["enabled"] is False
+
+    def test_verify_reset(self, client):
+        resp = client.post("/verify/reset")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "reset"
+
+
+# ---------------------------------------------------------------------------
 # Tests — Dashboard
 # ---------------------------------------------------------------------------
 
@@ -528,3 +593,57 @@ class TestDashboard:
         resp = client.get("/dashboard")
         assert "routing-chart" in resp.text
         assert "chart.js" in resp.text.lower() or "Chart" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Tests — Quality Assurance Endpoints
+# ---------------------------------------------------------------------------
+
+class TestQAEndpoints:
+    def test_qa_status(self, client):
+        resp = client.get("/qa")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "enabled" in data
+        assert "quality" in data
+        assert "cost" in data
+
+    def test_qa_categories_empty(self, client):
+        resp = client.get("/qa/categories")
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_qa_evidence(self, client):
+        resp = client.get("/qa/evidence")
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_qa_failures(self, client):
+        resp = client.get("/qa/failures")
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_qa_enable_disable(self, client):
+        resp = client.post("/qa/enable", json={"enabled": False})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "updated"
+        assert data["enabled"] is False
+
+    def test_qa_reset(self, client):
+        resp = client.post("/qa/reset")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "reset"
+
+    def test_qa_cost(self, client):
+        resp = client.get("/qa/cost")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "total_gated" in data
+        assert "estimated_shadow_cost_usd" in data
+
+    def test_qa_dashboard(self, client):
+        resp = client.get("/qa/dashboard")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+        assert "Quality Assurance" in resp.text

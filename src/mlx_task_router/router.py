@@ -13,19 +13,23 @@ Forward signals (push toward FORWARD):
   HARD    context too large
   HARD    model not loaded
   HARD    @cloud override
-  +0.5    complexity pattern detected (explain, refactor, debug…)
-  +0.3    code generation request (write a function, implement, create)
-  +0.4    extended conversation (>20 non-tool-result user turns)
-  +0.2    long message (>500 chars)
-  +0.2    question chain (multiple ?)
-  +0.2    many tools (>15 tool definitions)
-  +0.4    very many tools (>30 tool definitions)
+  +0.4    complexity pattern detected (explain, refactor, debug…)
+  +0.2    code generation request (write a function, implement, create)
+  +0.3    extended conversation (>30 non-tool-result user turns)
+  +0.15   long message (>500 chars)
+  +0.15   question chain (multiple ?)
+  +0.15   many tools (>15 tool definitions)
+  +0.3    very many tools (>30 tool definitions)
 
 Local reinforcement signals (reduce forward score):
   HARD    @local override
   -0.3    executable detected as first word
   -0.3    CLI action phrase
   -0.1    short message (<80 chars)
+
+With Qwen3.6-27B (77.2% SWE-bench, 59.3% Terminal-Bench), a single complexity
+or codegen signal stays local. Only stacked signals (e.g. complexity + codegen +
+long message, or complexity + extended conversation) trigger forwarding to Opus.
 """
 
 from __future__ import annotations
@@ -37,11 +41,14 @@ from typing import Any
 
 from mlx_task_router.annealing import weight_annealer
 from mlx_task_router.config import config
+from mlx_task_router.embed_router import embed_router
 from mlx_task_router.feedback import routing_feedback
+from mlx_task_router.verify_tuner import tuner as verify_tuner
 from mlx_task_router.local import model_manager
 
 
 class Route:
+    FAST = "fast"
     LOCAL = "local"
     FORWARD = "forward"
 
@@ -71,19 +78,59 @@ def _adaptive_threshold() -> float:
     return max(0.2, min(0.8, FORWARD_THRESHOLD + adjustment))
 
 # --- Forward signal weights (positive = push toward FORWARD) ---
-FWD_COMPLEXITY = 0.5
-FWD_CODE_GENERATION = 0.3
-FWD_EXTENDED_CONVO = 0.4
-FWD_LONG_MSG = 0.2
-FWD_QUESTION_CHAIN = 0.2
-FWD_MANY_TOOLS = 0.2
-FWD_VERY_MANY_TOOLS = 0.4
+# Tuned for Qwen3.6-27B (77.2% SWE-bench): single signal stays local,
+# only stacked signals forward to Opus 4.6.
+FWD_COMPLEXITY = 0.4
+FWD_CODE_GENERATION = 0.2
+FWD_EXTENDED_CONVO = 0.3
+FWD_LONG_MSG = 0.15
+FWD_QUESTION_CHAIN = 0.15
+FWD_MANY_TOOLS = 0.15
+FWD_VERY_MANY_TOOLS = 0.3
 
 # --- Local reinforcement weights (negative = pull toward LOCAL) ---
 LOCAL_EXEC_FIRST_WORD = -0.3
 LOCAL_EXEC_IN_TEXT = -0.15
 LOCAL_ACTION_PHRASE = -0.3
 LOCAL_SHORT_MSG = -0.1
+
+# --- Embedding routing weight ---
+EMBED_WEIGHT = config.embed_weight
+
+# --- Trivial request patterns (Tier 0 — fast model) ---
+_TRIVIAL_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"^\s*(git|ls|cd|cat|head|tail|grep|find|mkdir|rm|cp|mv|pwd|echo|touch|wc|chmod|chown|diff|which|whoami)\b",
+        r"^\s*(npm|yarn|pip|cargo|go|pnpm|bun)\s+(install|run|build|test|start|init|add|remove)\b",
+        r"^(fix|add|remove|rename|delete|update)\s+(the\s+)?(typo|import|comment|variable|line|semicolon|bracket)\b",
+        r"^(show|list|check|view|get)\s+(me\s+)?(the\s+)?(files?|status|logs?|diff|branches?|versions?|env|config)\b",
+        r"^\s*(docker|kubectl|terraform|make|cmake)\s+\w+",
+    ]
+]
+_TRIVIAL_MAX_LEN = 100
+
+
+def _is_trivial(text: str) -> bool:
+    """Detect trivial requests suitable for the fast (small) model."""
+    if len(text) > _TRIVIAL_MAX_LEN:
+        return False
+    for pattern in _TRIVIAL_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+def _get_weight(base: float, category: str) -> float:
+    """Apply annealing adjustment to a base signal weight.
+
+    Adjustments are bounded so a signal can never flip sign.
+    """
+    adj = weight_annealer.get_adjustment(category)
+    adjusted = base + adj
+    if base > 0:
+        return max(0.05, min(1.0, adjusted))
+    return min(-0.05, max(-1.0, adjusted))
 
 # ---------------------------------------------------------------------------
 # Forward signals — complexity patterns that should go to Claude
@@ -107,7 +154,7 @@ _COMPLEXITY_PATTERNS: list[re.Pattern[str]] = [
 _CODE_GEN_PATTERNS: list[re.Pattern[str]] = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        r"\b(write|develop|create|implement)\s+(a|an|the|this|new|my)\s+(function|class|module|component|service|api|endpoint|test|script)\b",
+        r"\b(write|develop|create|implement)\s+(a|an|the|this|new|my)\s+(?:\w+\s+)?(function|class|module|component|service|api|endpoint|test|script)\b",
         r"\b(scaffold|boilerplate|skeleton|stub)\b",
         r"\b(migrate|convert|port)\s+(to|from|the|this|between)\b",
         r"\b(write|create|draft)\s+(the\s+)?(docs|documentation|readme|docstring)\b",
@@ -220,8 +267,9 @@ def _score_forward(text: str, messages: list[Any], num_tools: int = 0) -> tuple[
     for pattern in _COMPLEXITY_PATTERNS:
         m = pattern.search(text)
         if m:
-            score += FWD_COMPLEXITY
-            reasons.append(f"complex:'{m.group()}' +{FWD_COMPLEXITY}")
+            w = _get_weight(FWD_COMPLEXITY, "complex")
+            score += w
+            reasons.append(f"complex:'{m.group()}' +{w:.2f}")
             trigger = f"complex:{m.group().lower()}"
             break
 
@@ -229,36 +277,42 @@ def _score_forward(text: str, messages: list[Any], num_tools: int = 0) -> tuple[
     for pattern in _CODE_GEN_PATTERNS:
         m = pattern.search(text)
         if m:
-            score += FWD_CODE_GENERATION
-            reasons.append(f"codegen:'{m.group()}' +{FWD_CODE_GENERATION}")
+            w = _get_weight(FWD_CODE_GENERATION, "codegen")
+            score += w
+            reasons.append(f"codegen:'{m.group()}' +{w:.2f}")
             if not trigger:
                 trigger = f"codegen:{m.group().lower()}"
             break
 
-    # Extended conversation (>20 non-tool-result user turns)
+    # Extended conversation (>30 non-tool-result user turns)
     turns = _count_turns(messages)
-    if turns > 20:
-        score += FWD_EXTENDED_CONVO
-        reasons.append(f"turns:{turns} +{FWD_EXTENDED_CONVO}")
+    if turns > 30:
+        w = _get_weight(FWD_EXTENDED_CONVO, "turns")
+        score += w
+        reasons.append(f"turns:{turns} +{w:.2f}")
 
     # Long message (>500 chars)
     if len(text) > 500:
-        score += FWD_LONG_MSG
-        reasons.append(f"long({len(text)}ch) +{FWD_LONG_MSG}")
+        w = _get_weight(FWD_LONG_MSG, "long")
+        score += w
+        reasons.append(f"long({len(text)}ch) +{w:.2f}")
 
     # Question chain (multiple ?)
     q_count = text.count("?")
     if q_count >= 2:
-        score += FWD_QUESTION_CHAIN
-        reasons.append(f"questions:{q_count} +{FWD_QUESTION_CHAIN}")
+        w = _get_weight(FWD_QUESTION_CHAIN, "questions")
+        score += w
+        reasons.append(f"questions:{q_count} +{w:.2f}")
 
     # Many tool definitions — harder for local models to handle
     if num_tools > 30:
-        score += FWD_VERY_MANY_TOOLS
-        reasons.append(f"tools:{num_tools} +{FWD_VERY_MANY_TOOLS}")
+        w = _get_weight(FWD_VERY_MANY_TOOLS, "tools")
+        score += w
+        reasons.append(f"tools:{num_tools} +{w:.2f}")
     elif num_tools > 15:
-        score += FWD_MANY_TOOLS
-        reasons.append(f"tools:{num_tools} +{FWD_MANY_TOOLS}")
+        w = _get_weight(FWD_MANY_TOOLS, "tools")
+        score += w
+        reasons.append(f"tools:{num_tools} +{w:.2f}")
 
     # --- Local reinforcement (negative = pull toward local) ---
 
@@ -295,6 +349,14 @@ def _score_forward(text: str, messages: list[Any], num_tools: int = 0) -> tuple[
         score += LOCAL_SHORT_MSG
         reasons.append(f"short {LOCAL_SHORT_MSG}")
 
+    # --- Embedding signal ---
+    embed_score = embed_router.score(text)
+    if embed_score is not None:
+        w = _get_weight(EMBED_WEIGHT, "embed")
+        contribution = w * embed_score
+        score += contribution
+        reasons.append(f"embed:{embed_score:.2f} +{contribution:.2f}")
+
     # --- Feedback adjustment ---
     if trigger:
         penalty = routing_feedback.penalty(trigger)
@@ -302,12 +364,15 @@ def _score_forward(text: str, messages: list[Any], num_tools: int = 0) -> tuple[
             score += penalty
             reasons.append(f"feedback:{trigger} {penalty:.2f}")
 
-    # --- Self-annealing weight adjustments ---
-    for category in ("complex", "codegen", "action", "exec"):
-        adj = weight_annealer.get_adjustment(category)
-        if adj != 0.0:
-            score += adj
-            reasons.append(f"anneal:{category} {adj:+.2f}")
+    # --- Verify tuner adjustments ---
+    v_adj = verify_tuner.get_adjustment("complexity")
+    if abs(v_adj) > 0.001 and any("complex:" in r for r in reasons):
+        score += v_adj
+        reasons.append(f"verify:complexity {v_adj:+.3f}")
+    v_adj_cg = verify_tuner.get_adjustment("code_generation")
+    if abs(v_adj_cg) > 0.001 and any("codegen:" in r for r in reasons):
+        score += v_adj_cg
+        reasons.append(f"verify:codegen {v_adj_cg:+.3f}")
 
     return score, reasons, trigger
 
@@ -424,14 +489,23 @@ def classify(request: Any, model_loaded: bool) -> tuple[str, str, str]:
     num_tools = len(tools) if tools else 0
     fwd_score, reasons, trigger = _score_forward(latest, messages, num_tools=num_tools)
     threshold = _adaptive_threshold()
+    # Apply verify tuner threshold adjustment
+    v_threshold_adj = verify_tuner.get_threshold_adjustment()
+    if abs(v_threshold_adj) > 0.001:
+        threshold += v_threshold_adj
+        threshold = max(0.3, min(1.0, threshold))  # Keep threshold sane
     reason_str = ", ".join(reasons)
     if threshold != FORWARD_THRESHOLD:
         reason_str += f", adaptive_t={threshold:.2f}"
 
     if fwd_score >= threshold:
         return Route.FORWARD, f"fwd={fwd_score:.2f} [{reason_str}]", trigger
-    else:
-        return Route.LOCAL, f"fwd={fwd_score:.2f} [{reason_str}]", trigger
+
+    # Check for trivial requests → FAST tier (only when fast model is configured)
+    if config.fast_model and fwd_score < config.trivial_threshold and _is_trivial(latest):
+        return Route.FAST, f"fwd={fwd_score:.2f} trivial [{reason_str}]", trigger
+
+    return Route.LOCAL, f"fwd={fwd_score:.2f} [{reason_str}]", trigger
 
 
 def strip_routing_prefix(text: str) -> str:

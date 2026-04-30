@@ -15,7 +15,8 @@ class TestConfigDefaults:
         assert c.model_name == DEFAULT_MODEL
         assert c.model_max_tokens == DEFAULT_MAX_TOKENS
 
-    def test_generation_defaults(self):
+    def test_generation_defaults(self, monkeypatch):
+        monkeypatch.delenv("MLX_DRAFT_MODEL", raising=False)
         c = Config()
         assert c.temperature == 0.6
         assert c.top_p == 0.95
@@ -51,3 +52,31 @@ class TestConfigEnvOverride:
         monkeypatch.setenv("ADAPTIVE_ROUTING", "false")
         c = Config()
         assert c.adaptive_routing is False
+
+    def test_embed_routing_defaults(self, monkeypatch):
+        monkeypatch.delenv("EMBED_ROUTING", raising=False)
+        monkeypatch.delenv("EMBED_WEIGHT", raising=False)
+        monkeypatch.delenv("EMBED_MIN_SAMPLES", raising=False)
+        c = Config()
+        assert c.embed_routing is True
+        assert c.embed_weight == 0.3
+        assert c.embed_min_samples == 100
+
+    def test_embed_routing_disabled(self, monkeypatch):
+        monkeypatch.setenv("EMBED_ROUTING", "false")
+        c = Config()
+        assert c.embed_routing is False
+
+    def test_fast_model_defaults(self, monkeypatch):
+        monkeypatch.delenv("MLX_FAST_MODEL", raising=False)
+        monkeypatch.delenv("FAST_MODEL_MAX_TOKENS", raising=False)
+        monkeypatch.delenv("TRIVIAL_THRESHOLD", raising=False)
+        c = Config()
+        assert c.fast_model == ""
+        assert c.fast_model_max_tokens == 2048
+        assert c.trivial_threshold == 0.3
+
+    def test_fast_model_override(self, monkeypatch):
+        monkeypatch.setenv("MLX_FAST_MODEL", "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit")
+        c = Config()
+        assert c.fast_model == "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit"

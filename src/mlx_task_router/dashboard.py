@@ -28,6 +28,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; }
   .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.25rem; }
   .badge-local { background: #065f46; color: #6ee7b7; }
+  .badge-fast { background: #164e63; color: #67e8f9; }
   .badge-forward { background: #7c2d12; color: #fdba74; }
   .badge-cache { background: #1e3a5f; color: #93c5fd; }
   .pulse { animation: pulse 2s ease-in-out infinite; }
@@ -66,7 +67,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 
 <!-- Summary Cards -->
-<div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-6">
+<div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-9 gap-3 mb-6">
   <div class="card">
     <div class="stat-label">Total Requests</div>
     <div class="stat-value text-white" id="stat-total">0</div>
@@ -88,8 +89,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="stat-value text-amber-400" id="stat-p50">0ms</div>
   </div>
   <div class="card">
+    <div class="stat-label">Fast Reqs</div>
+    <div class="stat-value text-cyan-400" id="stat-fast">0</div>
+  </div>
+  <div class="card">
     <div class="stat-label">Sessions</div>
     <div class="stat-value text-violet-400" id="stat-sessions">0</div>
+  </div>
+  <div class="card">
+    <div class="stat-label">TBV Pass</div>
+    <div class="stat-value text-rose-400" id="stat-tbv">—</div>
+  </div>
+  <div class="card" style="cursor:pointer" onclick="window.location='/qa/dashboard'">
+    <div class="stat-label">QA Score</div>
+    <div class="stat-value text-sky-400" id="stat-qa">—</div>
   </div>
 </div>
 
@@ -103,6 +116,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="flex justify-center gap-4 mt-3 text-xs">
       <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block"></span> Local</span>
+      <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-cyan-500 inline-block"></span> Fast</span>
       <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-orange-500 inline-block"></span> Forward</span>
       <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-sky-500 inline-block"></span> Cache</span>
     </div>
@@ -156,7 +170,7 @@ function fmtTime(ts) {
 }
 
 function badge(route) {
-  const cls = route === 'local' ? 'badge-local' : route === 'cache' ? 'badge-cache' : 'badge-forward';
+  const cls = route === 'local' ? 'badge-local' : route === 'fast' ? 'badge-fast' : route === 'cache' ? 'badge-cache' : 'badge-forward';
   return `<span class="px-1.5 py-0.5 rounded text-xs font-medium ${cls}">${route}</span>`;
 }
 
@@ -165,10 +179,10 @@ function initChart() {
   routingChart = new Chart(ctx, {
     type: 'doughnut',
     data: {
-      labels: ['Local', 'Forward', 'Cache'],
+      labels: ['Local', 'Fast', 'Forward', 'Cache'],
       datasets: [{
-        data: [0, 0, 0],
-        backgroundColor: ['#10b981', '#f97316', '#3b82f6'],
+        data: [0, 0, 0, 0],
+        backgroundColor: ['#10b981', '#06b6d4', '#f97316', '#3b82f6'],
         borderColor: '#1e293b',
         borderWidth: 3,
       }]
@@ -189,7 +203,7 @@ async function fetchJSON(path) {
 }
 
 async function refresh() {
-  const [root, stats, perf, history, sessionsSummary, sessions, health, cfg] = await Promise.all([
+  const [root, stats, perf, history, sessionsSummary, sessions, health, cfg, embed, pool, verify, qa] = await Promise.all([
     fetchJSON('/'),
     fetchJSON('/stats'),
     fetchJSON('/perf'),
@@ -198,6 +212,10 @@ async function refresh() {
     fetchJSON('/sessions?limit=10'),
     fetchJSON('/health'),
     fetchJSON('/config'),
+    fetchJSON('/embed'),
+    fetchJSON('/pool'),
+    fetchJSON('/verify'),
+    fetchJSON('/qa'),
   ]);
 
   // Header
@@ -216,6 +234,7 @@ async function refresh() {
     document.getElementById('stat-total').textContent = stats.requests_total.toLocaleString();
     document.getElementById('stat-local-pct').textContent = stats.local_percentage + '%';
     document.getElementById('stat-saved').textContent = stats.cost_saved_display;
+    document.getElementById('stat-fast').textContent = (stats.requests_fast || 0).toLocaleString();
   }
   if (perf) {
     document.getElementById('stat-tps').textContent = perf.local_tokens_per_sec || '—';
@@ -229,7 +248,7 @@ async function refresh() {
 
     // Chart
     if (routingChart) {
-      routingChart.data.datasets[0].data = [perf.local_count || 0, perf.forward_count || 0, perf.cache_count || 0];
+      routingChart.data.datasets[0].data = [perf.local_count || 0, perf.fast_count || 0, perf.forward_count || 0, perf.cache_count || 0];
       routingChart.update();
     }
   }
@@ -249,7 +268,33 @@ async function refresh() {
       `<div class="flex justify-between"><span>Max tokens</span><span class="font-mono text-white">${cfg.model_max_tokens}</span></div>`,
       `<div class="flex justify-between"><span>Context limit</span><span class="font-mono text-white">${cfg.max_local_context_tokens}</span></div>`,
       `<div class="flex justify-between"><span>Threshold</span><span class="font-mono text-white">${cfg.routing_threshold}</span></div>`,
-    ].join('');
+      cfg.embed_routing !== undefined ? `<div class="flex justify-between"><span>Embed routing</span><span class="font-mono text-white">${cfg.embed_routing ? 'on' : 'off'}</span></div>` : '',
+      cfg.fast_model ? `<div class="flex justify-between"><span>Fast model</span><span class="font-mono text-cyan-400 truncate ml-1" style="max-width:120px">${cfg.fast_model.split('/').pop()}</span></div>` : '',
+    ].filter(Boolean).join('');
+  }
+  if (embed) {
+    const embedLabel = embed.ready ? `<span class="text-emerald-400">ready (${embed.training_samples} samples)</span>` : `<span class="text-slate-500">collecting (${embed.training_samples}/${embed.min_samples})</span>`;
+    const section = document.getElementById('config-section');
+    section.innerHTML += `<div class="flex justify-between mt-1"><span>Embed probe</span>${embedLabel}</div>`;
+  }
+  if (pool) {
+    const poolLabel = pool.fast_available ? `<span class="text-cyan-400">loaded</span>` : `<span class="text-slate-500">off</span>`;
+    const section = document.getElementById('config-section');
+    section.innerHTML += `<div class="flex justify-between"><span>Fast pool</span>${poolLabel}</div>`;
+  }
+  if (verify) {
+    const pct = verify.total_verified > 0 ? Math.round(verify.pass_rate * 100) + '%' : '—';
+    document.getElementById('stat-tbv').textContent = pct;
+    const tbvLabel = verify.enabled ? `<span class="text-emerald-400">on (${verify.total_verified} checked)</span>` : `<span class="text-slate-500">off</span>`;
+    const section = document.getElementById('config-section');
+    section.innerHTML += `<div class="flex justify-between"><span>TBV</span>${tbvLabel}</div>`;
+  }
+  if (qa && qa.quality) {
+    const q = qa.quality;
+    document.getElementById('stat-qa').textContent = q.score !== null ? q.score + '%' : '—';
+    const qaLabel = qa.enabled ? `<span class="text-sky-400">on (${q.total_validated} validated)</span>` : `<span class="text-slate-500">off</span>`;
+    const section = document.getElementById('config-section');
+    section.innerHTML += `<div class="flex justify-between"><span>QA Gate</span>${qaLabel}</div>`;
   }
 
   // Recent decisions

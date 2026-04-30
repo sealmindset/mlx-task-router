@@ -21,7 +21,9 @@ from mlx_task_router.annealing import weight_annealer
 from mlx_task_router.cache import response_cache
 from mlx_task_router.dashboard import router as dashboard_router
 from mlx_task_router.config import config
+from mlx_task_router.embed_router import embed_router
 from mlx_task_router.feedback import routing_feedback
+from mlx_task_router.model_pool import ModelPool
 from mlx_task_router.perf import RequestMetric, perf_metrics
 from mlx_task_router.local import model_manager
 from mlx_task_router.models import MessagesRequest, TokenCountRequest
@@ -31,11 +33,19 @@ from mlx_task_router.routing_history import routing_history
 from mlx_task_router.semantic_cache import semantic_cache
 from mlx_task_router.session_stats import session_tracker
 from mlx_task_router.stats import stats
+from mlx_task_router.qa_dashboard import qa_dashboard_html
+from mlx_task_router.qa_gate import qa_gate
+from mlx_task_router.qa_trust import qa_trust
+from mlx_task_router.verify import tbv_engine, VerificationTask
+from mlx_task_router.verify_tuner import tuner as verify_tuner
 from mlx_task_router.watchdog import init_watchdog, watchdog as _wd_ref
+
+_model_pool: ModelPool | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _model_pool
     stats.start()
     routing_feedback.start()
     weight_annealer.start()
@@ -45,13 +55,23 @@ async def lifespan(app: FastAPI):
         await loop.run_in_executor(None, model_manager.load_model, config.model_name)
     else:
         print("[warn] No MLX_MODEL configured, starting without local model")
+    _model_pool = ModelPool(model_manager)
+    if config.fast_model:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _model_pool.load_fast_model)
+    if config.verify_enabled:
+        await tbv_engine.start()
     wd.start()
     yield
     wd.stop()
+    await tbv_engine.stop()
+    await qa_gate.shutdown()
     weight_annealer.stop()
     routing_feedback.stop()
     stats.stop()
     await shutdown_client()
+    if _model_pool and _model_pool.fast_available:
+        _model_pool.unload_fast()
     model_manager.unload()
     print("[server] Shutdown complete")
 
@@ -138,7 +158,10 @@ async def messages(request: Request):
     # Strip @cloud/@local prefix from the message before sending to any model
     _strip_prefix_from_request(parsed, body)
 
-    if route == Route.LOCAL:
+    # Record training example for embed router
+    embed_router.record_example(latest_text, route == Route.FORWARD)
+
+    if route in (Route.LOCAL, Route.FAST):
         tool_names = [t.name for t in parsed.tools] if parsed.tools else None
 
         cached = response_cache.get(latest_text, tool_names)
@@ -163,9 +186,26 @@ async def messages(request: Request):
                 )
             return JSONResponse(content=cached)
 
+        tier = "fast" if route == Route.FAST else "local"
+
+        # QA Gate: check if this request is in the uncertain zone
+        if (config.qa_gate_enabled
+                and not parsed.stream
+                and qa_gate.should_gate(_fwd_score)):
+            if config.log_routing:
+                print(f"[qa-gate] Request gated (fwd_score={_fwd_score:.2f})")
+            return await _handle_gated(
+                parsed, body, request, latest_text, tool_names, trigger,
+                routing_ms=routing_ms, tier=tier, forward_score=_fwd_score,
+            )
+
+        # Confident local — bypass gate
+        if config.qa_gate_enabled:
+            qa_trust.record_bypass()
+
         return await _handle_local(
             parsed, body, request, latest_text, tool_names, trigger,
-            routing_ms=routing_ms,
+            routing_ms=routing_ms, tier=tier,
         )
     else:
         return await _handle_forward(parsed, body, request, routing_ms=routing_ms)
@@ -272,6 +312,115 @@ async def reset_annealing():
     return {"status": "reset"}
 
 
+@app.get("/embed")
+async def embed_status():
+    return embed_router.status()
+
+
+@app.get("/pool")
+async def pool_status():
+    if _model_pool is None:
+        return {"status": "not initialized"}
+    return _model_pool.status()
+
+
+# --- Trust-But-Verify ---
+
+
+@app.get("/verify")
+async def verify_status():
+    return tbv_engine.status()
+
+
+@app.get("/verify/results")
+async def verify_results(limit: int = 20):
+    return tbv_engine.recent_results(limit=min(limit, 100))
+
+
+@app.get("/verify/adjustments")
+async def verify_adjustments():
+    return verify_tuner.status()
+
+
+@app.post("/verify/enable")
+async def verify_enable(request: Request):
+    body = await request.json()
+    if "enabled" in body:
+        config.verify_enabled = body["enabled"]
+        if config.verify_enabled and not tbv_engine._running:
+            await tbv_engine.start()
+        elif not config.verify_enabled:
+            await tbv_engine.stop()
+    if "shadow" in body:
+        config.verify_shadow_mode = body["shadow"]
+    return {
+        "status": "updated",
+        "enabled": config.verify_enabled,
+        "shadow_mode": config.verify_shadow_mode,
+    }
+
+
+@app.post("/verify/reset")
+async def verify_reset():
+    tbv_engine.reset()
+    verify_tuner.reset()
+    return {"status": "reset"}
+
+
+# --- Quality Assurance ---
+
+
+@app.get("/qa")
+async def qa_status():
+    return qa_trust.status()
+
+
+@app.get("/qa/categories")
+async def qa_categories():
+    return qa_trust.get_all_categories()
+
+
+@app.get("/qa/evidence")
+async def qa_evidence(limit: int = 20):
+    cats = qa_trust.get_all_categories()
+    return cats[:min(limit, 50)]
+
+
+@app.get("/qa/failures")
+async def qa_failures():
+    cats = qa_trust.get_all_categories()
+    return [c for c in cats if c.get("fail_count", 0) > 0]
+
+
+@app.post("/qa/enable")
+async def qa_enable(request: Request):
+    body = await request.json()
+    if "enabled" in body:
+        config.qa_gate_enabled = body["enabled"]
+    return {
+        "status": "updated",
+        "enabled": config.qa_gate_enabled,
+        "gate_lower": config.qa_gate_lower,
+        "gate_upper": config.qa_gate_upper,
+    }
+
+
+@app.post("/qa/reset")
+async def qa_reset():
+    qa_trust.reset()
+    return {"status": "reset"}
+
+
+@app.get("/qa/cost")
+async def qa_cost():
+    return qa_trust.cost_summary()
+
+
+@app.get("/qa/dashboard")
+async def qa_dashboard():
+    return qa_dashboard_html()
+
+
 # --- Sessions ---
 
 
@@ -352,6 +501,18 @@ async def get_config():
         "adaptive_routing": config.adaptive_routing,
         "log_routing": config.log_routing,
         "max_local_context_tokens": config.max_local_context_tokens,
+        "embed_routing": config.embed_routing,
+        "embed_weight": config.embed_weight,
+        "fast_model": config.fast_model,
+        "trivial_threshold": config.trivial_threshold,
+        "verify_enabled": config.verify_enabled,
+        "verify_shadow_mode": config.verify_shadow_mode,
+        "verify_model": config.verify_model,
+        "verify_auto_tune": config.verify_auto_tune,
+        "qa_gate_enabled": config.qa_gate_enabled,
+        "qa_gate_lower": config.qa_gate_lower,
+        "qa_gate_upper": config.qa_gate_upper,
+        "qa_gate_timeout": config.qa_gate_timeout,
     }
 
 
@@ -381,7 +542,7 @@ async def root():
     s = stats.get()
     return {
         "service": "mlx-task-router",
-        "version": "0.6.1",
+        "version": "1.2.0",
         "model_loaded": model_manager.is_loaded,
         "model": model_manager.current_model,
         "requests_total": s["requests_total"],
@@ -438,6 +599,46 @@ def _strip_prefix_from_request(parsed: MessagesRequest, body: dict[str, Any]):
             break
 
 
+async def _yield_events(events: list[str]):
+    """Replay buffered SSE events (used for cache hits)."""
+    for event in events:
+        yield event
+
+
+_STREAM_SENTINEL = object()
+
+
+def _maybe_queue_verification(
+    messages: list[dict],
+    response_text: str,
+    route: str,
+    forward_score: float,
+    trigger: str,
+    strategy: str = "local_check",
+) -> None:
+    """Queue a verification task if TBV decides to sample this request."""
+    if not config.verify_enabled:
+        return
+    threshold = config.routing_threshold
+    is_borderline = (
+        route == "forward"
+        and forward_score >= (threshold - 0.1)
+        and forward_score <= threshold
+    )
+    if not tbv_engine.should_sample(forward_score, is_borderline=is_borderline):
+        return
+    task = VerificationTask(
+        request_messages=messages,
+        response_text=response_text,
+        route=route,
+        forward_score=forward_score,
+        trigger=trigger,
+        strategy=strategy,
+        priority=2 if is_borderline else 1,
+    )
+    tbv_engine.enqueue(task)
+
+
 async def _handle_local(
     parsed: MessagesRequest,
     body: dict[str, Any],
@@ -446,51 +647,96 @@ async def _handle_local(
     cache_key_tools: list[str] | None = None,
     trigger: str = "",
     routing_ms: float = 0.0,
+    tier: str = "local",
 ):
+    use_fast = tier == "fast" and _model_pool is not None and _model_pool.fast_available
+    route_label = "fast" if use_fast else "local"
+
+    def _gen_func(req):
+        if use_fast:
+            return _model_pool.generate(req, tier="fast")
+        return model_manager.generate(req)
+
+    def _stream_func(req):
+        if use_fast:
+            return _model_pool.stream_generate(req, tier="fast")
+        return model_manager.stream_generate(req)
+
     try:
         t_gen_start = time.time()
         if parsed.stream:
-            events = await _collect_local_stream(parsed)
-            gen_ms = (time.time() - t_gen_start) * 1000
-            if cache_key_text:
-                response_cache.put(cache_key_text, events, cache_key_tools)
-                semantic_cache.put(cache_key_text, events, cache_key_tools)
-            if trigger:
-                routing_feedback.record_success(trigger)
-            # Extract token counts from SSE events for stats + perf metrics
-            _in, _out = _extract_tokens_from_events(events)
-            stats.record_local(
-                input_tokens=_in,
-                output_tokens=_out,
-                model=parsed.model,
-            )
-            perf_metrics.record(RequestMetric(
-                timestamp=time.time(), route="local",
-                total_ms=routing_ms + gen_ms,
-                routing_ms=routing_ms, generation_ms=gen_ms,
-                input_tokens=_in, output_tokens=_out,
-            ))
+            queue: asyncio.Queue[str | object] = asyncio.Queue()
+            collected: list[str] = []
+
+            def _producer():
+                try:
+                    for event in _stream_func(parsed):
+                        queue.put_nowait(event)
+                except Exception as exc:
+                    queue.put_nowait(exc)
+                finally:
+                    queue.put_nowait(_STREAM_SENTINEL)
+
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, _producer)
+
+            async def _realtime_stream():
+                gen_error = None
+                try:
+                    while True:
+                        item = await asyncio.wait_for(queue.get(), timeout=_GENERATION_TIMEOUT)
+                        if item is _STREAM_SENTINEL:
+                            break
+                        if isinstance(item, Exception):
+                            gen_error = item
+                            break
+                        collected.append(item)
+                        yield item
+                except asyncio.TimeoutError:
+                    gen_error = TimeoutError("Local generation timed out")
+
+                gen_ms = (time.time() - t_gen_start) * 1000
+
+                if gen_error:
+                    raise gen_error
+
+                _in, _out = _extract_tokens_from_events(collected)
+                if use_fast:
+                    stats.record_fast(input_tokens=_in, output_tokens=_out, model=parsed.model)
+                else:
+                    stats.record_local(input_tokens=_in, output_tokens=_out, model=parsed.model)
+                perf_metrics.record(RequestMetric(
+                    timestamp=time.time(), route=route_label,
+                    total_ms=routing_ms + gen_ms,
+                    routing_ms=routing_ms, generation_ms=gen_ms,
+                    input_tokens=_in, output_tokens=_out,
+                ))
+                if cache_key_text:
+                    response_cache.put(cache_key_text, collected, cache_key_tools)
+                    semantic_cache.put(cache_key_text, collected, cache_key_tools)
+                if trigger:
+                    routing_feedback.record_success(trigger)
+
             return StreamingResponse(
-                _yield_events(events),
+                _realtime_stream(),
                 media_type="text/event-stream",
             )
         else:
             loop = asyncio.get_event_loop()
             result = await asyncio.wait_for(
-                loop.run_in_executor(None, model_manager.generate, parsed),
+                loop.run_in_executor(None, _gen_func, parsed),
                 timeout=_GENERATION_TIMEOUT,
             )
             gen_ms = (time.time() - t_gen_start) * 1000
             usage = result.get("usage", {})
             in_tok = usage.get("input_tokens", 0)
             out_tok = usage.get("output_tokens", 0)
-            stats.record_local(
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-                model=parsed.model,
-            )
+            if use_fast:
+                stats.record_fast(input_tokens=in_tok, output_tokens=out_tok, model=parsed.model)
+            else:
+                stats.record_local(input_tokens=in_tok, output_tokens=out_tok, model=parsed.model)
             perf_metrics.record(RequestMetric(
-                timestamp=time.time(), route="local",
+                timestamp=time.time(), route=route_label,
                 total_ms=routing_ms + gen_ms,
                 routing_ms=routing_ms, generation_ms=gen_ms,
                 input_tokens=in_tok, output_tokens=out_tok,
@@ -500,6 +746,14 @@ async def _handle_local(
                 semantic_cache.put(cache_key_text, result, cache_key_tools)
             if trigger:
                 routing_feedback.record_success(trigger)
+            # TBV: queue verification for sampled local responses
+            _resp_text = ""
+            for block in result.get("content", []):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    _resp_text += block.get("text", "")
+            if _resp_text:
+                _msgs = [m.model_dump() if hasattr(m, "model_dump") else m for m in parsed.messages]
+                _maybe_queue_verification(_msgs, _resp_text, tier, 0.0, trigger)
             return JSONResponse(content=result)
     except Exception as e:
         print(f"[fallback] Local generation failed: {e}")
@@ -510,44 +764,6 @@ async def _handle_local(
             print("[fallback] Retrying via Anthropic API")
             return await _handle_forward(parsed, body, request)
         raise
-
-
-async def _collect_local_stream(parsed: MessagesRequest) -> list[str]:
-    loop = asyncio.get_event_loop()
-    return await asyncio.wait_for(
-        loop.run_in_executor(
-            None, lambda: list(model_manager.stream_generate(parsed))
-        ),
-        timeout=_GENERATION_TIMEOUT,
-    )
-
-
-async def _yield_events(events: list[str]):
-    input_tokens = 0
-    output_tokens = 0
-    model = ""
-
-    for event in events:
-        yield event
-        if "message_start" in event:
-            try:
-                data = json.loads(event.split("data: ", 1)[1])
-                input_tokens = data.get("message", {}).get("usage", {}).get("input_tokens", 0)
-                model = data.get("message", {}).get("model", "")
-            except (json.JSONDecodeError, IndexError):
-                pass
-        elif "message_delta" in event:
-            try:
-                data = json.loads(event.split("data: ", 1)[1])
-                output_tokens = data.get("usage", {}).get("output_tokens", 0)
-            except (json.JSONDecodeError, IndexError):
-                pass
-
-    stats.record_local(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        model=model,
-    )
 
 
 async def _handle_forward(
@@ -578,7 +794,184 @@ async def _handle_forward(
             routing_ms=routing_ms, generation_ms=fwd_ms,
             input_tokens=in_tok, output_tokens=out_tok,
         ))
+        # TBV: queue retroactive verification for sampled forwards
+        _resp_text = ""
+        for block in resp_json.get("content", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                _resp_text += block.get("text", "")
+        if _resp_text:
+            _msgs = [m.model_dump() if hasattr(m, "model_dump") else m for m in parsed.messages]
+            _maybe_queue_verification(
+                _msgs, _resp_text, "forward", 0.0, "", strategy="retroactive"
+            )
         return JSONResponse(content=resp_json, status_code=response.status_code)
+
+
+async def _handle_gated(
+    parsed: MessagesRequest,
+    body: dict[str, Any],
+    request: Request | None = None,
+    cache_key_text: str | None = None,
+    cache_key_tools: list[str] | None = None,
+    trigger: str = "",
+    routing_ms: float = 0.0,
+    tier: str = "local",
+    forward_score: float = 0.0,
+):
+    """Handle a gated request: generate local + Claude in parallel, validate, deliver winner."""
+    use_fast = tier == "fast" and _model_pool is not None and _model_pool.fast_available
+
+    def _gen_func(req):
+        if use_fast:
+            return _model_pool.generate(req, tier="fast")
+        return model_manager.generate(req)
+
+    t_start = time.time()
+    loop = asyncio.get_event_loop()
+    messages_raw = [m.model_dump() if hasattr(m, "model_dump") else m for m in parsed.messages]
+
+    # Launch local and Claude generation in parallel
+    local_task = asyncio.ensure_future(
+        asyncio.wait_for(
+            loop.run_in_executor(None, _gen_func, parsed),
+            timeout=_GENERATION_TIMEOUT,
+        )
+    )
+    claude_task = asyncio.ensure_future(
+        qa_gate.generate_claude_response(messages_raw)
+    )
+
+    local_result = None
+    local_text = ""
+    claude_text = ""
+    claude_tokens = 0
+
+    # Wait for both with timeout
+    try:
+        done, pending = await asyncio.wait(
+            [local_task, claude_task],
+            timeout=config.qa_gate_timeout,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+    except Exception:
+        done = set()
+        pending = {local_task, claude_task}
+
+    # Extract local result
+    if local_task in done and not local_task.cancelled() and local_task.exception() is None:
+        local_result = local_task.result()
+        for block in local_result.get("content", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                local_text += block.get("text", "")
+    else:
+        if not local_task.done():
+            local_task.cancel()
+
+    # Extract Claude result
+    if claude_task in done and not claude_task.cancelled() and claude_task.exception() is None:
+        claude_text, claude_tokens = claude_task.result()
+    else:
+        if not claude_task.done():
+            claude_task.cancel()
+
+    gen_ms = (time.time() - t_start) * 1000
+
+    # If either failed, deliver what we have (fail-open)
+    if not local_text and not claude_text:
+        # Both failed — fallback to forward
+        if config.log_routing:
+            print(f"[qa-gate] Both local and Claude failed, forwarding")
+        if request:
+            return await _handle_forward(parsed, body, request, routing_ms=routing_ms)
+        raise RuntimeError("QA gate: both local and Claude generation failed")
+
+    if not local_text:
+        # Local failed — deliver Claude response directly
+        if config.log_routing:
+            print(f"[qa-gate] Local failed, delivering Claude response")
+        result = _build_response(claude_text, parsed.model)
+        stats.record_forward(input_tokens=0, output_tokens=claude_tokens)
+        return JSONResponse(content=result)
+
+    if not claude_text:
+        # Claude failed — deliver local (fail-open)
+        if config.log_routing:
+            print(f"[qa-gate] Claude timeout/failed, delivering local (fail-open)")
+        qa_trust.record_bypass()
+        _record_local_stats(local_result, parsed, use_fast, routing_ms, gen_ms)
+        return JSONResponse(content=local_result)
+
+    # Both succeeded — validate equivalence
+    gate_result = await qa_gate.validate(
+        request_messages=messages_raw,
+        local_response=local_text,
+        claude_response=claude_text,
+        forward_score=forward_score,
+    )
+
+    if gate_result.equivalent:
+        # Local is good — deliver local response (saves API cost)
+        if config.log_routing:
+            print(
+                f"[qa-gate] PASS — delivering local "
+                f"(category={gate_result.category}, conf={gate_result.confidence:.2f})"
+            )
+        _record_local_stats(local_result, parsed, use_fast, routing_ms, gen_ms)
+        if cache_key_text:
+            response_cache.put(cache_key_text, local_result, cache_key_tools)
+            semantic_cache.put(cache_key_text, local_result, cache_key_tools)
+        if trigger:
+            routing_feedback.record_success(trigger)
+        return JSONResponse(content=local_result)
+    else:
+        # Local is not equivalent — deliver Claude response
+        if config.log_routing:
+            print(
+                f"[qa-gate] SWAP — delivering Claude response "
+                f"(category={gate_result.category}, reason={gate_result.reason})"
+            )
+        result = _build_response(claude_text, parsed.model)
+        stats.record_forward(input_tokens=0, output_tokens=claude_tokens)
+        perf_metrics.record(RequestMetric(
+            timestamp=time.time(), route="gate_swap",
+            total_ms=routing_ms + gen_ms + gate_result.elapsed_ms,
+            routing_ms=routing_ms, generation_ms=gen_ms,
+        ))
+        if trigger:
+            routing_feedback.record_failure(trigger)
+        return JSONResponse(content=result)
+
+
+def _record_local_stats(result: dict, parsed: MessagesRequest, use_fast: bool,
+                        routing_ms: float, gen_ms: float) -> None:
+    """Record stats for a local result delivered through the gate."""
+    usage = result.get("usage", {})
+    in_tok = usage.get("input_tokens", 0)
+    out_tok = usage.get("output_tokens", 0)
+    route_label = "fast" if use_fast else "local"
+    if use_fast:
+        stats.record_fast(input_tokens=in_tok, output_tokens=out_tok, model=parsed.model)
+    else:
+        stats.record_local(input_tokens=in_tok, output_tokens=out_tok, model=parsed.model)
+    perf_metrics.record(RequestMetric(
+        timestamp=time.time(), route=route_label,
+        total_ms=routing_ms + gen_ms,
+        routing_ms=routing_ms, generation_ms=gen_ms,
+        input_tokens=in_tok, output_tokens=out_tok,
+    ))
+
+
+def _build_response(text: str, model: str) -> dict:
+    """Build an Anthropic-style response from plain text."""
+    return {
+        "id": f"msg_qa_gate_{int(time.time())}",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+        "model": model,
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }
 
 
 async def _stream_forward_with_stats(

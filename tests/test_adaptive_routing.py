@@ -17,8 +17,8 @@ class TestAdaptiveThreshold:
     def test_returns_base_when_disabled(self):
         with patch("mlx_task_router.router.config") as mock_cfg:
             mock_cfg.adaptive_routing = False
-            mock_cfg.routing_threshold = 0.5
-            assert _adaptive_threshold() == 0.5
+            mock_cfg.routing_threshold = FORWARD_THRESHOLD
+            assert _adaptive_threshold() == FORWARD_THRESHOLD
 
     def test_returns_base_when_no_feedback(self):
         with patch("mlx_task_router.router.routing_feedback") as mock_fb:

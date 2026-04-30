@@ -40,6 +40,7 @@ class Stats:
         defaults = {
             "requests_total": 0,
             "requests_local": 0,
+            "requests_fast": 0,
             "requests_forwarded": 0,
             "tokens_local_input": 0,
             "tokens_local_output": 0,
@@ -95,6 +96,19 @@ class Stats:
             self._data["cost_saved_usd"] = round(self._data["cost_saved_usd"] + saved, 6)
             self._dirty = True
 
+    def record_fast(self, input_tokens: int, output_tokens: int, model: str = ""):
+        tier = _detect_tier(model)
+        pricing = PRICING[tier]
+        saved = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+
+        with self._lock:
+            self._data["requests_total"] += 1
+            self._data["requests_fast"] = self._data.get("requests_fast", 0) + 1
+            self._data["tokens_local_input"] += input_tokens
+            self._data["tokens_local_output"] += output_tokens
+            self._data["cost_saved_usd"] = round(self._data["cost_saved_usd"] + saved, 6)
+            self._dirty = True
+
     def record_forward(self, input_tokens: int = 0, output_tokens: int = 0):
         with self._lock:
             self._data["requests_total"] += 1
@@ -111,6 +125,7 @@ class Stats:
         if snapshot["requests_total"] > 0:
             local_pct = round(snapshot["requests_local"] / snapshot["requests_total"] * 100, 1)
 
+        snapshot["requests_fast"] = snapshot.get("requests_fast", 0)
         snapshot["local_percentage"] = local_pct
         snapshot["cost_saved_display"] = f"${snapshot['cost_saved_usd']:.4f}"
         snapshot["pricing_tier"] = DEFAULT_TIER
